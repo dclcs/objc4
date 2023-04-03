@@ -1,6 +1,7 @@
 // -*- truncate-lines: t; -*-
 
 // OPTION(var, env, help)
+// or, for internal-only options, INTERNAL_OPTION(var, env, help)
 
 OPTION( PrintImages,              OBJC_PRINT_IMAGES,               "log image and library names as they are loaded")
 OPTION( PrintImageTimes,          OBJC_PRINT_IMAGE_TIMES,          "measure duration of image loading steps")
@@ -37,7 +38,8 @@ OPTION( DebugPoolAllocation,      OBJC_DEBUG_POOL_ALLOCATION,      "halt when au
 OPTION( DebugDuplicateClasses,    OBJC_DEBUG_DUPLICATE_CLASSES,    "halt when multiple classes with the same name are present")
 OPTION( DebugDontCrash,           OBJC_DEBUG_DONT_CRASH,           "halt the process by exiting instead of crashing")
 OPTION( DebugPoolDepth,           OBJC_DEBUG_POOL_DEPTH,           "log fault when at least a set number of autorelease pages has been allocated")
-
+OPTION( DebugScribbleCaches,      OBJC_DEBUG_SCRIBBLE_CACHES,      "scribble the IMPs in freed method caches")
+OPTION( DebugScanWeakTables,      OBJC_DEBUG_SCAN_WEAK_TABLES,     "scan the weak references table continuously in the background - set OBJC_DEBUG_SCAN_WEAK_TABLES_INTERVAL_NANOSECONDS to set scanning interval (default 1000000)")
 OPTION( DisableVtables,           OBJC_DISABLE_VTABLES,            "disable vtable dispatch")
 OPTION( DisablePreopt,            OBJC_DISABLE_PREOPTIMIZATION,    "disable preoptimization courtesy of dyld shared cache")
 OPTION( DisableTaggedPointers,    OBJC_DISABLE_TAGGED_POINTERS,    "disable tagged pointer optimization of NSNumber et al.") 
@@ -48,3 +50,7 @@ OPTION( DisableFaults,            OBJC_DISABLE_FAULTS,             "disable os f
 OPTION( DisablePreoptCaches,      OBJC_DISABLE_PREOPTIMIZED_CACHES, "disable preoptimized caches")
 OPTION( DisableAutoreleaseCoalescing, OBJC_DISABLE_AUTORELEASE_COALESCING, "disable coalescing of autorelease pool pointers")
 OPTION( DisableAutoreleaseCoalescingLRU, OBJC_DISABLE_AUTORELEASE_COALESCING_LRU, "disable coalescing of autorelease pool pointers using look back N strategy")
+
+INTERNAL_OPTION( DisableClassRXSigningEnforcement, OBJC_DISABLE_CLASSRX_SIGNING_ENFORCEMENT, "disable class_rx_t pointer signing enforcement")
+INTERNAL_OPTION( DebugClassRXSigning,              OBJC_DEBUG_CLASS_RX_SIGNING,     "warn about class_rx_t pointer signing mismatches")
+INTERNAL_OPTION( DisableClassROFaults,             OBJC_DISABLE_CLASS_RO_FAULTS,    "disable os faults for class_ro_t pointer signing mismatches")

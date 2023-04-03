@@ -33,7 +33,12 @@
 * Imports.
 **********************************************************************/
 
-//#include <os/feature_private.h> // os_feature_enabled_simple()
+#include <TargetConditionals.h>
+
+#include <os/feature_private.h> // os_feature_enabled_simple()
+#include <os/variant_private.h> // os_variant_allows_internal_security_policies()
+
+#include "llvm-MathExtras.h"
 #include "objc-private.h"
 #include "objc-loadmethod.h"
 #include "objc-file.h"
@@ -47,8 +52,6 @@
 
 // NSObject was in Foundation/CF on macOS < 10.8.
 #if TARGET_OS_OSX
-#if __OBJC2__
-
 const char __objc_nsobject_class_10_5 = 0;
 const char __objc_nsobject_class_10_6 = 0;
 const char __objc_nsobject_class_10_7 = 0;
@@ -60,44 +63,38 @@ const char __objc_nsobject_metaclass_10_7 = 0;
 const char __objc_nsobject_isa_10_5 = 0;
 const char __objc_nsobject_isa_10_6 = 0;
 const char __objc_nsobject_isa_10_7 = 0;
-
-#else
-
-const char __objc_nsobject_class_10_5 = 0;
-const char __objc_nsobject_class_10_6 = 0;
-const char __objc_nsobject_class_10_7 = 0;
-
-#endif
 #endif
 
 // Settings from environment variables
 #define OPTION(var, env, help) bool var = false;
+#define INTERNAL_OPTION(var, env, help) bool var = false;
 #include "objc-env.h"
 #undef OPTION
+#undef INTERNAL_OPTION
 
 struct option_t {
     bool* var;
     const char *env;
     const char *help;
     size_t envlen;
+    bool internal;
 };
 
 const option_t Settings[] = {
-#define OPTION(var, env, help) option_t{&var, #env, help, strlen(#env)}, 
+#define OPTION(var, env, help) option_t{&var, #env, help, strlen(#env), false},
+#define INTERNAL_OPTION(var, env, help) \
+    option_t{&var, #env, help, strlen(#env), true},
 #include "objc-env.h"
 #undef OPTION
+#undef INTERNAL_OPTION
 };
 
 namespace objc {
     int PageCountWarning = 50;  // Default value if the environment variable is not set
 }
 
-// objc's key for pthread_getspecific
-#if SUPPORT_DIRECT_THREAD_KEYS
-#define _objc_pthread_key TLS_DIRECT_KEY
-#else
-static tls_key_t _objc_pthread_key;
-#endif
+// objc's TLS
+static tls_autoptr_direct(_objc_pthread_data, tls_key::main) _objc_tls;
 
 // Selectors
 SEL SEL_cxx_construct = NULL;
@@ -125,7 +122,7 @@ id objc_noop_imp(id self, SEL _cmd __unused) {
 * Some test code looks for the presence of this symbol.
 **********************************************************************/
 #if DEBUG != OBJC_IS_DEBUG_BUILD
-//#error mismatch in debug-ness macros
+#error mismatch in debug-ness macros
 // DEBUG is used in our code. OBJC_IS_DEBUG_BUILD is used in the
 // header declaration of _objc_isDebugBuild() because that header
 // is visible to other clients who might have their own DEBUG macro.
@@ -137,10 +134,7 @@ void _objc_isDebugBuild(void) { }
 
 
 /***********************************************************************
-* objc_getClass.  Return the id of the named class.  If the class does
-* not exist, call _objc_classLoader and then objc_classHandler, either of 
-* which may create a new class.
-* Warning: doesn't work if aClassName is the name of a posed-for class's isa!
+* objc_getClass.  Return the id of the named class.
 **********************************************************************/
 Class objc_getClass(const char *aClassName)
 {
@@ -167,8 +161,6 @@ Class objc_getRequiredClass(const char *aClassName)
 
 /***********************************************************************
 * objc_lookUpClass.  Return the id of the named class.
-* If the class does not exist, call _objc_classLoader, which may create 
-* a new class.
 *
 * Formerly objc_getClassWithoutWarning ()
 **********************************************************************/
@@ -244,7 +236,7 @@ objc::SafeRanges::add(uintptr_t start, uintptr_t end)
         // - size <= 64:  grow by  8
         // - size <= 128: grow by 16
         // ... etc
-        size += size < 16 ? 4 : 1 << (fls(size) - 3);
+        size += size < 16 ? 4 : 1 << (Log2_32(size) - 2);
         ranges = (Range *)realloc(ranges, sizeof(Range) * size);
     }
     ranges[count++] = Range{ start, end };
@@ -290,14 +282,12 @@ void appendHeader(header_info *hi)
         LastHeader = hi;
     }
 
-#if __OBJC2__
     if ((hi->mhdr()->flags & MH_DYLIB_IN_CACHE) == 0) {
         foreach_data_segment(hi->mhdr(), [](const segmentType *seg, intptr_t slide) {
             uintptr_t start = (uintptr_t)seg->vmaddr + slide;
             objc::dataSegmentsRanges.add(start, start + seg->vmsize);
         });
     }
-#endif
 }
 
 
@@ -332,14 +322,12 @@ void removeHeader(header_info *hi)
         prev = current;
     }
 
-#if __OBJC2__
     if ((hi->mhdr()->flags & MH_DYLIB_IN_CACHE) == 0) {
         foreach_data_segment(hi->mhdr(), [](const segmentType *seg, intptr_t slide) {
             uintptr_t start = (uintptr_t)seg->vmaddr + slide;
             objc::dataSegmentsRanges.remove(start, start + seg->vmsize);
         });
     }
-#endif
 }
 
 /***********************************************************************
@@ -376,8 +364,19 @@ void environ_init(void)
     // older SDKs. LRU coalescing can reorder releases and certain older apps
     // are accidentally relying on the ordering.
     // rdar://problem/63886091
-//    if (!dyld_program_sdk_at_least(dyld_fall_2020_os_versions))
-//        DisableAutoreleaseCoalescingLRU = true;
+    if (!dyld_program_sdk_at_least(dyld_fall_2020_os_versions))
+        DisableAutoreleaseCoalescingLRU = true;
+
+    // class_rx_t pointer signing enforcement is *disabled* by default unless
+    // this OS feature is enabled, but it can be explicitly enabled by setting
+    // the environment variable, for testing.
+    if (!os_feature_enabled_simple(objc4, classRxSigning, false))
+        DisableClassRXSigningEnforcement = true;
+
+    // Faults for class_ro_t pointer signing enforcement are disabled by
+    // default unless this OS feature is enabled.
+    if (!os_feature_enabled_simple(objc4, classRoSigningFaults, false))
+        DisableClassROFaults = true;
 
     bool PrintHelp = false;
     bool PrintOptions = false;
@@ -414,6 +413,9 @@ void environ_init(void)
         
         for (size_t i = 0; i < sizeof(Settings)/sizeof(Settings[0]); i++) {
             const option_t *opt = &Settings[i];
+            if (opt->internal
+                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
+                continue;
             if ((size_t)(value - *p) == 1+opt->envlen  &&  
                 0 == strncmp(*p, opt->env, opt->envlen))
             {
@@ -441,9 +443,9 @@ void environ_init(void)
         }
     }
 
-//    if (!os_feature_enabled_simple(objc4, preoptimizedCaches, true)) {
-//        DisablePreoptCaches = true;
-//    }
+    if (!os_feature_enabled_simple(objc4, preoptimizedCaches, true)) {
+        DisablePreoptCaches = true;
+    }
 
     // Print OBJC_HELP and OBJC_PRINT_OPTIONS output.
     if (PrintHelp  ||  PrintOptions) {
@@ -460,7 +462,10 @@ void environ_init(void)
         }
 
         for (size_t i = 0; i < sizeof(Settings)/sizeof(Settings[0]); i++) {
-            const option_t *opt = &Settings[i];            
+            const option_t *opt = &Settings[i];
+            if (opt->internal
+                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
+                continue;
             if (PrintHelp) _objc_inform("%s: %s", opt->env, opt->help);
             if (PrintOptions && *opt->var) _objc_inform("%s is set", opt->env);
         }
@@ -475,7 +480,7 @@ void environ_init(void)
 void 
 logReplacedMethod(const char *className, SEL s, 
                   bool isMeta, const char *catName, 
-                  IMP oldImp, IMP newImp)
+                  void *oldImp, void *newImp)
 {
     const char *oldImage = "??";
     const char *newImage = "??";
@@ -483,14 +488,10 @@ logReplacedMethod(const char *className, SEL s,
     // Silently ignore +load replacement because category +load is special
     if (s == @selector(load)) return;
 
-#if TARGET_OS_WIN32
-    // don't know dladdr()/dli_fname equivalent
-#else
     Dl_info dl;
 
-    if (dladdr((void*)oldImp, &dl)  &&  dl.dli_fname) oldImage = dl.dli_fname;
-    if (dladdr((void*)newImp, &dl)  &&  dl.dli_fname) newImage = dl.dli_fname;
-#endif
+    if (dladdr(oldImp, &dl)  &&  dl.dli_fname) oldImage = dl.dli_fname;
+    if (dladdr(newImp, &dl)  &&  dl.dli_fname) newImage = dl.dli_fname;
     
     _objc_inform("REPLACED: %c[%s %s]  %s%s  (IMP was %p (%s), now %p (%s))",
                  isMeta ? '+' : '-', className, sel_getName(s), 
@@ -507,54 +508,31 @@ logReplacedMethod(const char *className, SEL s,
 **********************************************************************/
 _objc_pthread_data *_objc_fetch_pthread_data(bool create)
 {
-    _objc_pthread_data *data;
-
-    data = (_objc_pthread_data *)tls_get(_objc_pthread_key);
-    if (!data  &&  create) {
-        data = (_objc_pthread_data *)
-            calloc(1, sizeof(_objc_pthread_data));
-        tls_set(_objc_pthread_key, data);
-    }
-
-    return data;
+    return _objc_tls.get(create);
 }
 
 
 /***********************************************************************
-* _objc_pthread_destroyspecific
+* _objc_pthread_data::~_objc_pthread_data()
 * Destructor for objc's per-thread data.
 * arg shouldn't be NULL, but we check anyway.
 **********************************************************************/
 extern void _destroyInitializingClassList(struct _objc_initializing_classes *list);
-void _objc_pthread_destroyspecific(void *arg)
-{
-    _objc_pthread_data *data = (_objc_pthread_data *)arg;
-    if (data != NULL) {
-        _destroyInitializingClassList(data->initializingClasses);
-        _destroySyncCache(data->syncCache);
-        _destroyAltHandlerList(data->handlerList);
-        for (int i = 0; i < (int)countof(data->printableNames); i++) {
-            if (data->printableNames[i]) {
-                free(data->printableNames[i]);  
-            }
+
+_objc_pthread_data::~_objc_pthread_data() {
+    _destroyInitializingClassList(initializingClasses);
+    _destroySyncCache(syncCache);
+    _destroyAltHandlerList(handlerList);
+    for (int i = 0; i < (int)countof(printableNames); i++) {
+        if (printableNames[i]) {
+            free(printableNames[i]);  
         }
-        free(data->classNameLookups);
-
-        // add further cleanup here...
-
-        free(data);
     }
+    free(classNameLookups);
+
+    // add further cleanup here...
 }
 
-
-void tls_init(void)
-{
-#if SUPPORT_DIRECT_THREAD_KEYS
-    pthread_key_init_np(TLS_DIRECT_KEY, &_objc_pthread_destroyspecific);
-#else
-    _objc_pthread_key = tls_create(&_objc_pthread_destroyspecific);
-#endif
-}
 
 
 /***********************************************************************
@@ -572,14 +550,6 @@ void _objcInit(void)
 /***********************************************************************
 * objc_setForwardHandler
 **********************************************************************/
-
-#if !__OBJC2__
-
-// Default forward handler (nil) goes to forward:: dispatch.
-void *_objc_forward_handler = nil;
-void *_objc_forward_stret_handler = nil;
-
-#else
 
 // Default forward handler halts the process.
 __attribute__((noreturn, cold)) void
@@ -602,8 +572,6 @@ objc_defaultForwardStretHandler(id self, SEL sel)
 void *_objc_forward_stret_handler = (void*)objc_defaultForwardStretHandler;
 #endif
 
-#endif
-
 void objc_setForwardHandler(void *fwd, void *fwd_stret)
 {
     _objc_forward_handler = fwd;
@@ -613,16 +581,8 @@ void objc_setForwardHandler(void *fwd, void *fwd_stret)
 }
 
 
-#if !__OBJC2__
-// GrP fixme
-extern "C" Class _objc_getOrigClass(const char *name);
-#endif
-
 static BOOL internal_class_getImageName(Class cls, const char **outName)
 {
-#if !__OBJC2__
-    cls = _objc_getOrigClass(cls->demangledName());
-#endif
     auto result = dyld_image_path_containing_address(cls);
     *outName = result;
     return (result != nil);
@@ -703,7 +663,7 @@ objc_setAssociatedObject(id object, const void *key, id value, objc_AssociationP
 void objc_removeAssociatedObjects(id object) 
 {
     if (object && object->hasAssociatedObjects()) {
-        _object_remove_assocations(object, /*deallocating*/false);
+        _object_remove_associations(object, /*deallocating*/false);
     }
 }
 

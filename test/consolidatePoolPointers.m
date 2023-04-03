@@ -1,4 +1,4 @@
-//TEST_CONFIG MEM=mrc ARCH=x86_64,ARM64,ARM64e
+//TEST_CONFIG MEM=mrc ARCH=x86_64,arm64,arm64e
 //TEST_ENV OBJC_DISABLE_AUTORELEASE_COALESCING=NO OBJC_DISABLE_AUTORELEASE_COALESCING_LRU=NO
 
 #include "test.h"
@@ -77,6 +77,8 @@ void test(int objCount, int autoreleaseCount, int expectedGap) {
     // handle pool boundaries.
     for (int i = 0; i < objCount; i++)
         [[objs[i] retain] autorelease];
+    // Flush any stale autorelease TLS entries.
+    objc_autoreleasePoolPop(objc_autoreleasePoolPush());
     for (int i = 0; i < objCount; i++) {
         testassertequal(objs[i]->retains, autoreleaseCount + 1);
         testassertequal(objs[i]->releases, 0);

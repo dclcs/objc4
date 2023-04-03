@@ -9,7 +9,7 @@ END
 
 #include "test.h"
 #include "swift-class-def.m"
-
+#include <ptrauth.h>
 
 // _objc_swiftMetadataInitializer hooks for the classes in swift-class-def.m
 
@@ -19,21 +19,6 @@ Class initSuper(Class cls __unused, void *arg __unused)
     // SwiftSub's init is first. SwiftSuper's init is never called.
 
     fail("SwiftSuper's init should not have been called");
-}
-
-bool isRealized(Class cls)
-{
-    // check the is-realized bits directly
-
-#if __LP64__
-# define mask (~(uintptr_t)7)
-#else
-# define mask (~(uintptr_t)3)
-#endif
-#define RW_REALIZED (1<<31)
-    
-    uintptr_t rw = ((uintptr_t *)cls)[4] & mask;  // class_t->data
-    return ((uint32_t *)rw)[0] & RW_REALIZED;  // class_rw_t->flags
 }
 
 SWIFT_CLASS(SwiftSuper, NSObject, initSuper);
@@ -68,6 +53,7 @@ Class initSub(Class cls, void *arg)
     // Re-sign the isa and super pointers in the new location.
     ((Class __ptrauth_objc_isa_pointer *)(void *)HeapSwiftSub)[0] = ((Class __ptrauth_objc_isa_pointer *)(void *)RawRealSwiftSub)[0];
     ((Class __ptrauth_objc_super_pointer *)(void *)HeapSwiftSub)[1] = ((Class __ptrauth_objc_super_pointer *)(void *)RawRealSwiftSub)[1];
+    ((void *__ptrauth_objc_class_ro *)(void *)HeapSwiftSub)[4] = ((void * __ptrauth_objc_class_ro *)(void *)RawRealSwiftSub)[4];
 
     testprintf("initSub beginning _objc_realizeClassFromSwift\n");
     _objc_realizeClassFromSwift(HeapSwiftSub, cls);

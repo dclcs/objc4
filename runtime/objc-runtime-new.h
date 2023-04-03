@@ -1,15 +1,15 @@
 /*
  * Copyright (c) 2005-2007 Apple Inc.  All Rights Reserved.
- * 
+ *
  * @APPLE_LICENSE_HEADER_START@
- * 
+ *
  * This file contains Original Code and/or Modifications of Original Code
  * as defined in and that are subject to the Apple Public Source License
  * Version 2.0 (the 'License'). You may not use this file except in
  * compliance with the License. Please obtain a copy of the License at
  * http://www.opensource.apple.com/apsl/ and read it before using this
  * file.
- * 
+ *
  * The Original Code and all software distributed under the License are
  * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
  * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
@@ -17,7 +17,7 @@
  * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
  * Please see the License for the specific language governing rights and
  * limitations under the License.
- * 
+ *
  * @APPLE_LICENSE_HEADER_END@
  */
 
@@ -123,46 +123,20 @@
 //   _tryRetain/_isDeallocating/retainWeakReference/allowsWeakReference
 #define FAST_HAS_DEFAULT_RR     (1UL<<2)
 // data pointer
-#define FAST_DATA_MASK          0x00007ffffffffff8UL
-
-#if __arm64__
-// class or superclass has .cxx_construct/.cxx_destruct implementation
-//   FAST_CACHE_HAS_CXX_DTOR is the first bit so that setting it in
-//   isa_t::has_cxx_dtor is a single bfi
-#define FAST_CACHE_HAS_CXX_DTOR       (1<<0)
-#define FAST_CACHE_HAS_CXX_CTOR       (1<<1)
-// Denormalized RO_META to avoid an indirection
-#define FAST_CACHE_META               (1<<2)
+#if TARGET_OS_IPHONE && !TARGET_OS_SIMULATOR
+#define FAST_DATA_MASK          0x0000007ffffffff8UL
 #else
-// Denormalized RO_META to avoid an indirection
-#define FAST_CACHE_META               (1<<0)
-// class or superclass has .cxx_construct/.cxx_destruct implementation
-//   FAST_CACHE_HAS_CXX_DTOR is chosen to alias with isa_t::has_cxx_dtor
-#define FAST_CACHE_HAS_CXX_CTOR       (1<<1)
-#define FAST_CACHE_HAS_CXX_DTOR       (1<<2)
+#define FAST_DATA_MASK          0x00007ffffffffff8UL
 #endif
 
-// Fast Alloc fields:
-//   This stores the word-aligned size of instances + "ALLOC_DELTA16",
-//   or 0 if the instance size doesn't fit.
-//
-//   These bits occupy the same bits than in the instance size, so that
-//   the size can be extracted with a simple mask operation.
-//
-//   FAST_CACHE_ALLOC_MASK16 allows to extract the instance size rounded
-//   rounded up to the next 16 byte boundary, which is a fastpath for
-//   _objc_rootAllocWithZone()
-#define FAST_CACHE_ALLOC_MASK         0x1ff8
-#define FAST_CACHE_ALLOC_MASK16       0x1ff0
-#define FAST_CACHE_ALLOC_DELTA16      0x0008
+static_assert((OBJC_VM_MAX_ADDRESS & FAST_DATA_MASK)
+              == (OBJC_VM_MAX_ADDRESS & ~7UL),
+              "FAST_DATA_MASK must not mask off pointer bits");
 
-// class's instances requires raw isa
-#define FAST_CACHE_REQUIRES_RAW_ISA   (1<<13)
-// class or superclass has default alloc/allocWithZone: implementation
-// Note this is is stored in the metaclass.
-#define FAST_CACHE_HAS_DEFAULT_AWZ    (1<<14)
-// class or superclass has default new/self/class/respondsToSelector/isKindOfClass
-#define FAST_CACHE_HAS_DEFAULT_CORE   (1<<15)
+// just the flags
+#define FAST_FLAGS_MASK         0x0000000000000007UL
+// this bit tells us *quickly* that it's a pointer to an rw, not an ro
+#define FAST_IS_RW_POINTER      0x8000000000000000UL
 
 #else
 
@@ -189,7 +163,10 @@
 #define FAST_IS_SWIFT_STABLE  (1UL<<1)
 // data pointer
 #define FAST_DATA_MASK        0xfffffffcUL
-
+// flags mask
+#define FAST_FLAGS_MASK       0x00000003UL
+// no fast RW pointer flag on 32-bit
+#define FAST_IS_RW_POINTER    0
 #endif // __LP64__
 
 // The Swift ABI requires that these bits be defined like this on all platforms.
@@ -208,6 +185,21 @@ struct swift_class_t;
 
 enum Atomicity { Atomic = true, NotAtomic = false };
 enum IMPEncoding { Encoded = true, Raw = false };
+
+// Strip TBI bits. We'll only use the top four bits at most so only strip those.
+// Does nothing on targets that don't have TBI.
+static inline void *stripTBI(void *p) {
+#if __arm64__
+    return (void *)((uintptr_t)p & 0x0fffffffffffffff);
+#else
+    return p;
+#endif
+}
+
+static inline void try_free(const void *p)
+{
+    if (p && malloc_size(p)) free((void *)p);
+}
 
 struct bucket_t {
 private:
@@ -285,33 +277,27 @@ public:
 #endif
     }
 
+    inline void scribbleIMP(uintptr_t value) {
+        _imp.store(value, memory_order_relaxed);
+    }
+
     template <Atomicity, IMPEncoding>
     void set(bucket_t *base, SEL newSel, IMP newImp, Class cls);
 };
 
 /* dyld_shared_cache_builder and obj-C agree on these definitions */
-enum {
-    OBJC_OPT_METHODNAME_START      = 0,
-    OBJC_OPT_METHODNAME_END        = 1,
-    OBJC_OPT_INLINED_METHODS_START = 2,
-    OBJC_OPT_INLINED_METHODS_END   = 3,
-
-    __OBJC_OPT_OFFSETS_COUNT,
-};
-
-#if CONFIG_USE_PREOPT_CACHES
-extern uintptr_t objc_opt_offsets[__OBJC_OPT_OFFSETS_COUNT];
-#endif
-
-/* dyld_shared_cache_builder and obj-C agree on these definitions */
 struct preopt_cache_entry_t {
-    uint32_t sel_offs;
-    uint32_t imp_offs;
+    int64_t raw_imp_offs : 38; // actual IMP offset from the isa >> 2
+    uint64_t sel_offs : 26;
+
+    inline int64_t imp_offset() const {
+        return raw_imp_offs << 2;
+    }
 };
 
 /* dyld_shared_cache_builder and obj-C agree on these definitions */
 struct preopt_cache_t {
-    int32_t  fallback_class_offset;
+    int64_t  fallback_class_offset;
     union {
         struct {
             uint16_t shift       :  5;
@@ -321,7 +307,9 @@ struct preopt_cache_t {
     };
     uint16_t occupied    : 14;
     uint16_t has_inlines :  1;
-    uint16_t bit_one     :  1;
+    uint16_t padding     :  1;
+    uint32_t unused      : 31;
+    uint32_t bit_one     :  1;
     preopt_cache_entry_t entries[];
 
     inline int capacity() const {
@@ -339,19 +327,50 @@ struct cache_t {
 private:
     explicit_atomic<uintptr_t> _bucketsAndMaybeMask;
     union {
+        // Note: _flags on ARM64 needs to line up with the unused bits of
+        // _originalPreoptCache because we access some flags (specifically
+        // FAST_CACHE_HAS_DEFAULT_CORE and FAST_CACHE_HAS_DEFAULT_AWZ) on
+        // unrealized classes with the assumption that they will start out
+        // as 0.
         struct {
-            explicit_atomic<mask_t>    _maybeMask;
-#if __LP64__
-            uint16_t                   _flags;
-#endif
+#if CACHE_MASK_STORAGE == CACHE_MASK_STORAGE_OUTLINED && !__LP64__
+            // Outlined cache mask storage, 32-bit, we have mask and occupied.
+            explicit_atomic<mask_t>    _mask;
             uint16_t                   _occupied;
+#elif CACHE_MASK_STORAGE == CACHE_MASK_STORAGE_OUTLINED && __LP64__
+            // Outlined cache mask storage, 64-bit, we have mask, occupied, flags.
+            explicit_atomic<mask_t>    _mask;
+            uint16_t                   _occupied;
+            uint16_t                   _flags;
+#   define CACHE_T_HAS_FLAGS 1
+#elif __LP64__
+            // Inline cache mask storage, 64-bit, we have occupied, flags, and
+            // empty space to line up flags with originalPreoptCache.
+            //
+            // Note: the assembly code for objc_release_xN knows about the
+            // location of _flags and the
+            // FAST_CACHE_HAS_CUSTOM_DEALLOC_INITIATION flag within. Any changes
+            // must be applied there as well.
+            uint32_t                   _unused;
+            uint16_t                   _occupied;
+            uint16_t                   _flags;
+#   define CACHE_T_HAS_FLAGS 1
+#else
+            // Inline cache mask storage, 32-bit, we have occupied, flags.
+            uint16_t                   _occupied;
+            uint16_t                   _flags;
+#   define CACHE_T_HAS_FLAGS 1
+#endif
+
         };
         explicit_atomic<preopt_cache_t *> _originalPreoptCache;
     };
 
+    // Simple constructor for testing purposes only.
+    cache_t() : _bucketsAndMaybeMask(0) {}
+
 #if CACHE_MASK_STORAGE == CACHE_MASK_STORAGE_OUTLINED
     // _bucketsAndMaybeMask is a buckets_t pointer
-    // _maybeMask is the buckets mask
 
     static constexpr uintptr_t bucketsMask = ~0ul;
     static_assert(!CONFIG_USE_PREOPT_CACHES, "preoptimized caches not supported");
@@ -359,15 +378,14 @@ private:
     static constexpr uintptr_t maskShift = 48;
     static constexpr uintptr_t maxMask = ((uintptr_t)1 << (64 - maskShift)) - 1;
     static constexpr uintptr_t bucketsMask = ((uintptr_t)1 << maskShift) - 1;
-    
-    static_assert(bucketsMask >= MACH_VM_MAX_ADDRESS, "Bucket field doesn't have enough bits for arbitrary pointers.");
+
+    static_assert(bucketsMask >= OBJC_VM_MAX_ADDRESS, "Bucket field doesn't have enough bits for arbitrary pointers.");
 #if CONFIG_USE_PREOPT_CACHES
     static constexpr uintptr_t preoptBucketsMarker = 1ul;
     static constexpr uintptr_t preoptBucketsMask = bucketsMask & ~preoptBucketsMarker;
 #endif
 #elif CACHE_MASK_STORAGE == CACHE_MASK_STORAGE_HIGH_16
     // _bucketsAndMaybeMask is a buckets_t pointer in the low 48 bits
-    // _maybeMask is unused, the mask is stored in the top 16 bits.
 
     // How much the mask is shifted by.
     static constexpr uintptr_t maskShift = 48;
@@ -379,12 +397,12 @@ private:
 
     // The largest mask value we can store.
     static constexpr uintptr_t maxMask = ((uintptr_t)1 << (64 - maskShift)) - 1;
-    
+
     // The mask applied to `_maskAndBuckets` to retrieve the buckets pointer.
     static constexpr uintptr_t bucketsMask = ((uintptr_t)1 << (maskShift - maskZeroBits)) - 1;
-    
+
     // Ensure we have enough bits for the buckets pointer.
-    static_assert(bucketsMask >= MACH_VM_MAX_ADDRESS,
+    static_assert(bucketsMask >= OBJC_VM_MAX_ADDRESS,
             "Bucket field doesn't have enough bits for arbitrary pointers.");
 
 #if CONFIG_USE_PREOPT_CACHES
@@ -414,7 +432,6 @@ private:
 #endif // CONFIG_USE_PREOPT_CACHES
 #elif CACHE_MASK_STORAGE == CACHE_MASK_STORAGE_LOW_4
     // _bucketsAndMaybeMask is a buckets_t pointer in the top 28 bits
-    // _maybeMask is unused, the mask length is stored in the low 4 bits
 
     static constexpr uintptr_t maskBits = 4;
     static constexpr uintptr_t maskMask = (1 << maskBits) - 1;
@@ -455,7 +472,7 @@ public:
     Class cls() const;
 
 #if CONFIG_USE_PREOPT_CACHES
-    const preopt_cache_t *preopt_cache() const;
+    const preopt_cache_t *preopt_cache(bool authenticated = true) const;
 #endif
 
     mask_t occupied() const;
@@ -486,7 +503,52 @@ public:
     static void collectNolock(bool collectALot);
     static size_t bytesForCapacity(uint32_t cap);
 
-#if __LP64__
+#if CACHE_T_HAS_FLAGS
+#   if __arm64__
+// class or superclass has .cxx_construct/.cxx_destruct implementation
+//   FAST_CACHE_HAS_CXX_DTOR is the first bit so that setting it in
+//   isa_t::has_cxx_dtor is a single bfi
+#       define FAST_CACHE_HAS_CXX_DTOR       (1<<0)
+#       define FAST_CACHE_HAS_CXX_CTOR       (1<<1)
+// Denormalized RO_META to avoid an indirection
+#       define FAST_CACHE_META               (1<<2)
+#   else
+// Denormalized RO_META to avoid an indirection
+#       define FAST_CACHE_META               (1<<0)
+// class or superclass has .cxx_construct/.cxx_destruct implementation
+//   FAST_CACHE_HAS_CXX_DTOR is chosen to alias with isa_t::has_cxx_dtor
+#       define FAST_CACHE_HAS_CXX_CTOR       (1<<1)
+#       define FAST_CACHE_HAS_CXX_DTOR       (1<<2)
+#endif
+
+// Fast Alloc fields:
+//   This stores the word-aligned size of instances + "ALLOC_DELTA16",
+//   or 0 if the instance size doesn't fit.
+//
+//   These bits occupy the same bits than in the instance size, so that
+//   the size can be extracted with a simple mask operation.
+//
+//   FAST_CACHE_ALLOC_MASK16 allows to extract the instance size rounded
+//   rounded up to the next 16 byte boundary, which is a fastpath for
+//   _objc_rootAllocWithZone()
+
+// The code in fastInstanceSize/setFastInstanceSize is not quite right for
+// 32-bit, so we currently only enable this for 64-bit.
+#   if __LP64__
+#       define FAST_CACHE_ALLOC_MASK         0x0ff8
+#       define FAST_CACHE_ALLOC_MASK16       0x0ff0
+#       define FAST_CACHE_ALLOC_DELTA16      0x0008
+#   endif
+
+#   define FAST_CACHE_HAS_CUSTOM_DEALLOC_INITIATION (1<<12)
+// class's instances requires raw isa
+#   define FAST_CACHE_REQUIRES_RAW_ISA   (1<<13)
+// class or superclass has default alloc/allocWithZone: implementation
+// Note this is is stored in the metaclass.
+#   define FAST_CACHE_HAS_DEFAULT_AWZ    (1<<14)
+// class or superclass has default new/self/class/respondsToSelector/isKindOfClass
+#   define FAST_CACHE_HAS_DEFAULT_CORE   (1<<15)
+
     bool getBit(uint16_t flags) const {
         return _flags & flags;
     }
@@ -549,6 +611,7 @@ public:
 #endif
 };
 
+static_assert(sizeof(cache_t) == 2 * sizeof(void *), "cache_t must be two words");
 
 // classref_t is unremapped class_t*
 typedef struct classref * classref_t;
@@ -562,17 +625,28 @@ typedef struct classref * classref_t;
 * and adding the offset stored within it. This is a 32-bit signed
 * offset giving ±2GB of range.
 **********************************************************************/
-template <typename T>
+template <typename T, bool isNullable = true>
 struct RelativePointer: nocopy_t {
     int32_t offset;
 
-    T get() const {
-        if (offset == 0)
+    void *getRaw(uintptr_t base) const {
+        if (isNullable && offset == 0)
             return nullptr;
-        uintptr_t base = (uintptr_t)&offset;
         uintptr_t signExtendedOffset = (uintptr_t)(intptr_t)offset;
         uintptr_t pointer = base + signExtendedOffset;
-        return (T)pointer;
+        return (void *)pointer;
+    }
+
+    void *getRaw() const {
+        return getRaw((uintptr_t)&offset);
+    }
+
+    T get(uintptr_t base) const {
+        return (T)getRaw(base);
+    }
+
+    T get() const {
+        return (T)getRaw();
     }
 };
 
@@ -616,11 +690,11 @@ struct entsize_list_tt {
         return entsizeAndFlags & FlagMask;
     }
 
-    Element& getOrEnd(uint32_t i) const { 
+    Element& getOrEnd(uint32_t i) const {
         ASSERT(i <= count);
-        return *PointerModifier::modify(*this, (Element *)((uint8_t *)this + sizeof(*this) + i*entsize()));
+        return *PointerModifier::modify(*(List *)this, (Element *)((uint8_t *)this + sizeof(*this) + i*entsize()));
     }
-    Element& get(uint32_t i) const { 
+    Element& get(uint32_t i) const {
         ASSERT(i < count);
         return getOrEnd(i);
     }
@@ -628,29 +702,43 @@ struct entsize_list_tt {
     size_t byteSize() const {
         return byteSize(entsize(), count);
     }
-    
+
     static size_t byteSize(uint32_t entsize, uint32_t count) {
         return sizeof(entsize_list_tt) + count*entsize;
     }
 
-    struct iterator;
-    const iterator begin() const { 
-        return iterator(*static_cast<const List*>(this), 0); 
+    template <bool authenticated>
+    struct iteratorImpl;
+    using iterator = iteratorImpl<false>;
+    using signedIterator = iteratorImpl<true>;
+    const iterator begin() const {
+        return iterator(*static_cast<const List*>(this), 0);
     }
-    iterator begin() { 
-        return iterator(*static_cast<const List*>(this), 0); 
+    iterator begin() {
+        return iterator(*static_cast<const List*>(this), 0);
     }
-    const iterator end() const { 
-        return iterator(*static_cast<const List*>(this), count); 
+    const iterator end() const {
+        return iterator(*static_cast<const List*>(this), count);
     }
-    iterator end() { 
-        return iterator(*static_cast<const List*>(this), count); 
+    iterator end() {
+        return iterator(*static_cast<const List*>(this), count);
     }
 
-    struct iterator {
+    const signedIterator signedBegin() const {
+        return signedIterator(*static_cast<const List *>(this), 0);
+    }
+    const signedIterator signedEnd() const {
+        return signedIterator(*static_cast<const List*>(this), count);
+    }
+
+    template <bool authenticated>
+    struct iteratorImpl {
         uint32_t entsize;
         uint32_t index;  // keeping track of this saves a divide in operator-
-        Element* element;
+
+        using ElementPtr = std::conditional_t<authenticated, Element * __ptrauth(ptrauth_key_process_dependent_data, 1, 0xdead), Element *>;
+
+        ElementPtr element;
 
         typedef std::random_access_iterator_tag iterator_category;
         typedef Element value_type;
@@ -658,41 +746,41 @@ struct entsize_list_tt {
         typedef Element* pointer;
         typedef Element& reference;
 
-        iterator() { }
+        iteratorImpl() { }
 
-        iterator(const List& list, uint32_t start = 0)
+        iteratorImpl(const List& list, uint32_t start = 0)
             : entsize(list.entsize())
             , index(start)
             , element(&list.getOrEnd(start))
         { }
 
-        const iterator& operator += (ptrdiff_t delta) {
+        const iteratorImpl& operator += (ptrdiff_t delta) {
             element = (Element*)((uint8_t *)element + delta*entsize);
             index += (int32_t)delta;
             return *this;
         }
-        const iterator& operator -= (ptrdiff_t delta) {
+        const iteratorImpl& operator -= (ptrdiff_t delta) {
             element = (Element*)((uint8_t *)element - delta*entsize);
             index -= (int32_t)delta;
             return *this;
         }
-        const iterator operator + (ptrdiff_t delta) const {
-            return iterator(*this) += delta;
+        const iteratorImpl operator + (ptrdiff_t delta) const {
+            return iteratorImpl(*this) += delta;
         }
-        const iterator operator - (ptrdiff_t delta) const {
-            return iterator(*this) -= delta;
-        }
-
-        iterator& operator ++ () { *this += 1; return *this; }
-        iterator& operator -- () { *this -= 1; return *this; }
-        iterator operator ++ (int) {
-            iterator result(*this); *this += 1; return result;
-        }
-        iterator operator -- (int) {
-            iterator result(*this); *this -= 1; return result;
+        const iteratorImpl operator - (ptrdiff_t delta) const {
+            return iteratorImpl(*this) -= delta;
         }
 
-        ptrdiff_t operator - (const iterator& rhs) const {
+        iteratorImpl& operator ++ () { *this += 1; return *this; }
+        iteratorImpl& operator -- () { *this -= 1; return *this; }
+        iteratorImpl operator ++ (int) {
+            iteratorImpl result(*this); *this += 1; return result;
+        }
+        iteratorImpl operator -- (int) {
+            iteratorImpl result(*this); *this -= 1; return result;
+        }
+
+        ptrdiff_t operator - (const iteratorImpl& rhs) const {
             return (ptrdiff_t)this->index - (ptrdiff_t)rhs.index;
         }
 
@@ -701,17 +789,17 @@ struct entsize_list_tt {
 
         operator Element& () const { return *element; }
 
-        bool operator == (const iterator& rhs) const {
+        bool operator == (const iteratorImpl& rhs) const {
             return this->element == rhs.element;
         }
-        bool operator != (const iterator& rhs) const {
+        bool operator != (const iteratorImpl& rhs) const {
             return this->element != rhs.element;
         }
 
-        bool operator < (const iterator& rhs) const {
+        bool operator < (const iteratorImpl& rhs) const {
             return this->element < rhs.element;
         }
-        bool operator > (const iterator& rhs) const {
+        bool operator > (const iteratorImpl& rhs) const {
             return this->element > rhs.element;
         }
     };
@@ -723,9 +811,76 @@ namespace objc {
 static inline bool inSharedCache(uintptr_t ptr);
 }
 
-struct method_t {
-    static const uint32_t smallMethodListFlag = 0x80000000;
+// All shared cache relative method lists names are offsets from this selector.
+extern "C" uintptr_t sharedCacheRelativeMethodBase();
 
+// We have four kinds of methods: small, small direct, big, and big signed. (Big
+// signed is only used on ARM64e.) We distinguish between them using a
+// complicated set of flags and other checks.
+//
+// All methods consist of three values: name (selector), types, and imp. The
+// difference is in how those values are represented:
+//
+// 1. Small methods represent the values as 32-bit offsets relative to the
+//    address of each field. Selectors are an offset to a selref. This
+//    representation is used on disk, and is always emitted as read-only memory.
+// 2. Small direct methods are the same as small methods, except the selector is
+//    an offset to the shared cache's special explodey-head selector. This
+//    representation is used in the shared cache.
+// 3. Big methods represent the values as pointers. This is the original method
+//    list format and was the only format for a long time. On ARM64e, the imp is
+//    signed, but the selector and types are not. This representation is used on
+//    disk, usually when targeting older OSes that don't have support for small
+//    methods, but sometimes when that particular corner of the compiler or
+//    linker just hasn't been upgraded to emit small methods.
+// 4. Big signed methods are the same as big methods, but the selector is
+//    signed. These are used internally by the runtime for dynamically allocated
+//    method lists created by calls like `class_addMethod`.
+//
+// These different kinds must be distinguished in two contexts: method pointers,
+// and method list pointers. Method list pointers are the complicated one, so
+// we'll start there:
+// 1. Small method lists are identified by setting `smallMethodListFlag` in the
+//    method list flags. This flag is set by the compiler.
+// 2. Small direct method lists are additionally identified by being within the
+//    address range of the shared cache.
+// 3. Big methods have no flags set, since they are the historical default.
+// 4. Big signed methods are identified by setting `bigSignedMethodListFlag` in
+//    the method list pointer itself. The runtime sets this flag in the pointer
+//    when creating a new method list at runtime.
+//
+// Method pointers are never emitted by the compiler and exist entirely within
+// the runtime, making this task somewhat simpler. A method's kind is indicated
+// by the lower two bits in the pointer. Methods are always 4-byte aligned so
+// those bits are never set in the pointer value itself.
+//
+// OVERWRITE PROTECTION
+//
+// We protect these values from overwrites on systems with pointer
+// authentication. This protection is multifaceted and not completely obvious.
+// Here's how it works.
+//
+// 1. Method pointers are signed before returning them to clients, and
+//    authenticated when clients pass them in. The signature includes the low
+//    bits that store the kind. An attacker is therefore not able to create a
+//    new method pointer from scratch, nor change the kind of a legitimate
+//    method pointer. Method pointers are not stored in memory in the runtime.
+// 2. Small and small direct method lists are always in read-only memory,
+//    protecting them from any alteration.
+// 3. Big signed method lists are indicated with a flag in the method list
+//    pointer.
+// 4. Method list pointers are signed, preventing forgery of a method list
+//    pointer. This signature includes the big signed method list flag.
+// 5. Big method lists are vulnerable in two ways: the selector is
+//    unauthenticated, and the flags are unauthenticated such that an attacker
+//    could potentially set `smallMethodListFlag` to get a small method list in
+//    mutable memory. We will mitigate this by ensuring the compiler/linker
+//    never emit big method lists.
+// 6. Although big signed method lists do not sign their flags,
+//    `smallMethodListFlag` is ignored when `bigSignedMethodListFlag` is set.
+//    Since `bigSignedMethodListFlag` is authenticated, it cannot be cleared by
+//    an attacker.
+struct method_t {
     method_t(const method_t &other) = delete;
 
     // The representation of a "big" method. This is the traditional
@@ -737,9 +892,46 @@ struct method_t {
         MethodListIMP imp;
     };
 
+    // A "big" method, but name is signed. Used for method lists created at runtime.
+    struct bigSigned {
+        SEL __ptrauth_objc_sel name;
+        const char * ptrauth_method_list_types types;
+        MethodListIMP imp;
+    };
+
+    // Various things assume big and bigSigned are the same size, make sure we
+    // don't accidentally break that.
+    static_assert(sizeof(struct big) == sizeof(struct bigSigned), "big and bigSigned are expected to be the same size");
+
+    enum class Kind {
+        // Note: method_invoke detects small methods by detecting 1 in the low
+        // bit. Any change to that will require a corresponding change to
+        // method_invoke.
+        big = 0,
+
+        // `small` encompasses both small and small direct methods. We
+        // distinguish those cases by doing a range check against the shared
+        // cache.
+        small = 1,
+        bigSigned = 2,
+    };
+
 private:
-    bool isSmall() const {
-        return ((uintptr_t)this & 1) == 1;
+    static const uintptr_t kindMask = 0x3;
+
+    Kind getKind() const {
+        return Kind((uintptr_t)this & kindMask);
+    }
+
+    void *getPointer() const {
+        return (void *)((uintptr_t)this & ~kindMask);
+    }
+
+    method_t *withKind(Kind kind) {
+        uintptr_t combined = (uintptr_t)this->getPointer() | (uintptr_t)kind;
+        method_t *ret = (method_t *)combined;
+        ASSERT(ret->getKind() == kind);
+        return ret;
     }
 
     // The representation of a "small" method. This stores three
@@ -749,7 +941,7 @@ private:
         // cache) or a selref (everywhere else).
         RelativePointer<const void *> name;
         RelativePointer<const char *> types;
-        RelativePointer<IMP> imp;
+        RelativePointer<IMP, /*isNullable*/false> imp;
 
         bool inSharedCache() const {
             return (CONFIG_SHARED_CACHE_RELATIVE_DIRECT_SELECTORS &&
@@ -758,13 +950,13 @@ private:
     };
 
     small &small() const {
-        ASSERT(isSmall());
-        return *(struct small *)((uintptr_t)this & ~(uintptr_t)1);
+        ASSERT(getKind() == Kind::small);
+        return *(struct small *)getPointer();
     }
 
     IMP remappedImp(bool needsLock) const;
     void remapImp(IMP imp);
-    objc_method_description *getSmallDescription() const;
+    objc_method_description *getCachedDescription() const;
 
 public:
     static const auto bigSize = sizeof(struct big);
@@ -777,43 +969,96 @@ public:
     struct pointer_modifier {
         template <typename ListType>
         static method_t *modify(const ListType &list, method_t *ptr) {
-            if (list.flags() & smallMethodListFlag)
-                return (method_t *)((uintptr_t)ptr | 1);
-            return ptr;
+            return ptr->withKind(list.listKind());
         }
     };
 
     big &big() const {
-        ASSERT(!isSmall());
-        return *(struct big *)this;
+        ASSERT(getKind() == Kind::big);
+        return *(struct big *)getPointer();
     }
 
-    SEL name() const {
-        if (isSmall()) {
-            return (small().inSharedCache()
-                    ? (SEL)small().name.get()
-                    : *(SEL *)small().name.get());
-        } else {
-            return big().name;
+    bigSigned &bigSigned() const {
+        ASSERT(getKind() == Kind::bigSigned);
+        return *(struct bigSigned *)getPointer();
+    }
+
+    ALWAYS_INLINE SEL name() const {
+        switch (getKind()) {
+            case Kind::small:
+                if (small().inSharedCache()) {
+                    return (SEL)small().name.get(sharedCacheRelativeMethodBase());
+                } else {
+                    // Outside of the shared cache, relative methods point to a selRef
+                    return *(SEL *)small().name.get();
+                }
+            case Kind::big:
+                return big().name;
+            case Kind::bigSigned:
+                return bigSigned().name;
         }
     }
+
     const char *types() const {
-        return isSmall() ? small().types.get() : big().types;
-    }
-    IMP imp(bool needsLock) const {
-        if (isSmall()) {
-            IMP imp = remappedImp(needsLock);
-            if (!imp)
-                imp = ptrauth_sign_unauthenticated(small().imp.get(),
-                                                   ptrauth_key_function_pointer, 0);
-            return imp;
+        switch (getKind()) {
+            case Kind::small:
+                return small().types.get();
+            case Kind::big:
+                return big().types;
+            case Kind::bigSigned:
+                return bigSigned().types;
         }
-        return big().imp;
+    }
+
+    IMP imp(bool needsLock) const {
+        switch (getKind()) {
+            case Kind::small: {
+                IMP smallIMP = ptrauth_sign_unauthenticated(small().imp.get(),
+                                                            ptrauth_key_function_pointer, 0);
+                // We must sign the newly generated function pointer before calling
+                // out to remappedImp(). That call may spill `this` leaving it open
+                // to being overwritten while it's on the stack. By signing first,
+                // we'll spill the signed function pointer instead, which is
+                // resistant to being overwritten.
+                //
+                // The compiler REALLY wants to perform this signing operation after
+                // the call to remappedImp. This asm statement prevents it from
+                // doing that reordering.
+                asm ("": : "r" (smallIMP) :);
+
+                IMP remappedIMP = remappedImp(needsLock);
+                if (remappedIMP)
+                    return remappedIMP;
+                return smallIMP;
+            }
+            case Kind::big:
+                return big().imp;
+            case Kind::bigSigned:
+                return bigSigned().imp;
+        }
+    }
+
+    // Fetch the IMP as a `void *`. Avoid signing relative IMPs. This
+    // avoids signing oracles in cases where we're just logging the
+    // value. Runtime lock must be held.
+    void *impRaw() const {
+        switch (getKind()) {
+            case Kind::small: {
+                IMP remappedIMP = remappedImp(false);
+                if (remappedIMP)
+                    return (void *)remappedIMP;
+                return small().imp.getRaw();
+            }
+            case Kind::big:
+                return (void *)big().imp;
+            case Kind::bigSigned:
+                return (void *)bigSigned().imp;
+        }
     }
 
     SEL getSmallNameAsSEL() const {
         ASSERT(small().inSharedCache());
-        return (SEL)small().name.get();
+        return (SEL)small().name.get(sharedCacheRelativeMethodBase());
     }
 
     SEL getSmallNameAsSELRef() const {
@@ -822,40 +1067,74 @@ public:
     }
 
     void setName(SEL name) {
-        if (isSmall()) {
-            ASSERT(!small().inSharedCache());
-            *(SEL *)small().name.get() = name;
-        } else {
-            big().name = name;
+        switch (getKind()) {
+            case Kind::small:
+                ASSERT(!small().inSharedCache());
+                *(SEL *)small().name.get() = name;
+                break;
+            case Kind::big:
+                big().name = name;
+                break;
+            case Kind::bigSigned:
+                bigSigned().name = name;
+                break;
         }
     }
 
     void setImp(IMP imp) {
-        if (isSmall()) {
-            remapImp(imp);
-        } else {
-            big().imp = imp;
+        switch (getKind()) {
+            case Kind::small:
+                remapImp(imp);
+                break;
+            case Kind::big:
+                big().imp = imp;
+                break;
+            case Kind::bigSigned:
+                bigSigned().imp = imp;
+                break;
         }
     }
 
     objc_method_description *getDescription() const {
-        return isSmall() ? getSmallDescription() : (struct objc_method_description *)this;
+        switch (getKind()) {
+            case Kind::small:
+                return getCachedDescription();
+            case Kind::big:
+                return(struct objc_method_description *)getPointer();
+            case Kind::bigSigned:
+                return getCachedDescription();
+        }
     }
 
-    struct SortBySELAddress :
-    public std::binary_function<const struct method_t::big&,
-                                const struct method_t::big&, bool>
+    void tryFreeContents_nolock();
+
+    struct SortBySELAddress
     {
         bool operator() (const struct method_t::big& lhs,
                          const struct method_t::big& rhs)
         { return lhs.name < rhs.name; }
+
+        bool operator() (const struct method_t::bigSigned& lhs,
+                         const struct method_t::bigSigned& rhs)
+        { return lhs.name < rhs.name; }
     };
 
     method_t &operator=(const method_t &other) {
-        ASSERT(!isSmall());
-        big().name = other.name();
-        big().types = other.types();
-        big().imp = other.imp(false);
+        switch (getKind()) {
+            case Kind::small:
+                _objc_fatal("Cannot assign to small method %p from method %p", this, &other);
+                break;
+            case Kind::big:
+                big().imp = other.imp(false);
+                big().name = other.name();
+                big().types = other.types();
+                break;
+            case Kind::bigSigned:
+                bigSigned().imp = other.imp(false);
+                bigSigned().name = other.name();
+                bigSigned().types = other.types();
+                break;
+        }
         return *this;
     }
 };
@@ -864,9 +1143,9 @@ struct ivar_t {
 #if __x86_64__
     // *offset was originally 64-bit on some x86_64 platforms.
     // We read and write only 32 bits of it.
-    // Some metadata provides all 64 bits. This is harmless for unsigned 
+    // Some metadata provides all 64 bits. This is harmless for unsigned
     // little-endian values.
-    // Some code uses all 64 bits. class_addIvar() over-allocates the 
+    // Some code uses all 64 bits. class_addIvar() over-allocates the
     // offset for their benefit.
 #endif
     int32_t *offset;
@@ -897,41 +1176,116 @@ struct property_t {
 // method lists. Older runtimes will treat them as part of the entry
 // size!)
 struct method_list_t : entsize_list_tt<method_t, method_list_t, 0xffff0003, method_t::pointer_modifier> {
+#if __has_feature(ptrauth_calls)
+    // This flag is ORed into method list pointers to indicate that the list is
+    // a big list with signed pointers. Use a bit in TBI so we don't have to
+    // mask it out to use the pointer.
+    static const uintptr_t bigSignedMethodListFlag = 0x8000000000000000;
+#else
+    static const uintptr_t bigSignedMethodListFlag = 0x0;
+#endif
+
+    static const uint32_t smallMethodListFlag = 0x80000000;
+
+    // We don't use this currently, but the shared cache builder sets it, so be
+    // mindful we don't collide.
+    static const uint32_t relativeMethodSelectorsAreDirectFlag = 0x40000000;
+
+    static method_list_t *allocateMethodList(uint32_t count, uint32_t flags) {
+        void *allocation = calloc(method_list_t::byteSize(count,
+                                                          method_t::bigSize), 1);
+
+        // Place bigSignedMethodListFlag into the new list pointer. TBI ensures
+        // that we can still use the pointer.
+        method_list_t *newlist = (method_list_t *)((uintptr_t)allocation | bigSignedMethodListFlag);
+        newlist->entsizeAndFlags =
+            (uint32_t)sizeof(struct method_t::big) | flags;
+        newlist->count = count;
+        return newlist;
+    }
+
+    void deallocate() {
+        free(stripTBI(this));
+    }
+
     bool isUniqued() const;
     bool isFixedUp() const;
     void setFixedUp();
 
     uint32_t indexOfMethod(const method_t *meth) const {
-        uint32_t i = 
+        uint32_t i =
             (uint32_t)(((uintptr_t)meth - (uintptr_t)this) / entsize());
         ASSERT(i < count);
         return i;
     }
 
-    bool isSmallList() const {
-        return flags() & method_t::smallMethodListFlag;
+    method_t::Kind listKind() const {
+        if ((uintptr_t)this & bigSignedMethodListFlag)
+            return method_t::Kind::bigSigned;
+        if (flags() & smallMethodListFlag)
+            return method_t::Kind::small;
+        else
+            return method_t::Kind::big;
     }
 
     bool isExpectedSize() const {
-        if (isSmallList())
+        if (listKind() == method_t::Kind::small)
             return entsize() == method_t::smallSize;
         else
             return entsize() == method_t::bigSize;
     }
 
     method_list_t *duplicate() const {
-        method_list_t *dup;
-        if (isSmallList()) {
-            dup = (method_list_t *)calloc(byteSize(method_t::bigSize, count), 1);
-            dup->entsizeAndFlags = method_t::bigSize;
-        } else {
-            dup = (method_list_t *)calloc(this->byteSize(), 1);
-            dup->entsizeAndFlags = this->entsizeAndFlags;
-        }
-        dup->count = this->count;
-        std::copy(begin(), end(), dup->begin());
+        auto begin = signedBegin();
+        auto end = signedEnd();
+
+        uint32_t newFlags = listKind() == method_t::Kind::small ? 0 : flags();
+        method_list_t *dup = allocateMethodList(count, newFlags);
+        std::copy(begin, end, dup->begin());
         return dup;
     }
+
+    void sortBySELAddress() {
+        switch (listKind()) {
+            case method_t::Kind::small:
+                _objc_fatal("Cannot sort small method list %p", this);
+                break;
+            case method_t::Kind::big:
+                method_t::SortBySELAddress sorter;
+                std::stable_sort(&begin()->big(), &end()->big(), sorter);
+                break;
+            case method_t::Kind::bigSigned:;
+                std::stable_sort(&begin()->bigSigned(), &end()->bigSigned(), sorter);
+                break;
+        }
+    }
+
+    struct Ptrauth {
+        static const uint16_t discriminator = 0xC310;
+        static_assert(std::is_same<
+                      void * __ptrauth_objc_method_list_pointer *,
+                      void * __ptrauth(ptrauth_key_method_list_pointer, 1, discriminator) *>::value,
+                      "Method list pointer signing discriminator must match ptrauth.h");
+
+        ALWAYS_INLINE static method_list_t *sign (method_list_t *ptr, const void *address) {
+            return ptrauth_sign_unauthenticated(ptr,
+                                                ptrauth_key_method_list_pointer,
+                                                ptrauth_blend_discriminator(address,
+                                                                            discriminator));
+        }
+
+        ALWAYS_INLINE static method_list_t *auth(method_list_t *ptr, const void *address) {
+            (void)address;
+#if __has_feature(ptrauth_calls)
+            if (ptr)
+                ptr = ptrauth_auth_data(ptr,
+                                        ptrauth_key_method_list_pointer,
+                                        ptrauth_blend_discriminator(address,
+                                                                    discriminator));
+#endif
+            return ptr;
+        }
+    };
 };
 
 struct ivar_list_t : entsize_list_tt<ivar_t, ivar_list_t, 0> {
@@ -1048,9 +1402,7 @@ struct class_ro_t {
     };
 
     explicit_atomic<const char *> name;
-    // With ptrauth, this is signed if it points to a small list, but
-    // may be unsigned if it points to a big list.
-    void *baseMethodList;
+    WrappedPtr<method_list_t, method_list_t::Ptrauth> baseMethods;
     protocol_list_t * baseProtocols;
     const ivar_list_t * ivars;
 
@@ -1072,45 +1424,6 @@ struct class_ro_t {
         return name.load(std::memory_order_acquire);
     }
 
-    static const uint16_t methodListPointerDiscriminator = 0xC310;
-#if 0 // FIXME: enable this when we get a non-empty definition of __ptrauth_objc_method_list_pointer from ptrauth.h.
-        static_assert(std::is_same<
-                      void * __ptrauth_objc_method_list_pointer *,
-                      void * __ptrauth(ptrauth_key_method_list_pointer, 1, methodListPointerDiscriminator) *>::value,
-                      "Method list pointer signing discriminator must match ptrauth.h");
-#endif
-
-    method_list_t *baseMethods() const {
-#if __has_feature(ptrauth_calls)
-        method_list_t *ptr = ptrauth_strip((method_list_t *)baseMethodList, ptrauth_key_method_list_pointer);
-        if (ptr == nullptr)
-            return nullptr;
-
-        // Don't auth if the class_ro and the method list are both in the shared cache.
-        // This is secure since they'll be read-only, and this allows the shared cache
-        // to cut down on the number of signed pointers it has.
-        bool roInSharedCache = objc::inSharedCache((uintptr_t)this);
-        bool listInSharedCache = objc::inSharedCache((uintptr_t)ptr);
-        if (roInSharedCache && listInSharedCache)
-            return ptr;
-
-        // Auth all other small lists.
-        if (ptr->isSmallList())
-            ptr = ptrauth_auth_data((method_list_t *)baseMethodList,
-                                    ptrauth_key_method_list_pointer,
-                                    ptrauth_blend_discriminator(&baseMethodList,
-                                                                methodListPointerDiscriminator));
-        return ptr;
-#else
-        return (method_list_t *)baseMethodList;
-#endif
-    }
-
-    uintptr_t baseMethodListPtrauthData() const {
-        return ptrauth_blend_discriminator(&baseMethodList,
-                                           methodListPointerDiscriminator);
-    }
-
     class_ro_t *duplicate() const {
         bool hasSwiftInitializer = flags & RO_HAS_SWIFT_INITIALIZER;
 
@@ -1124,35 +1437,8 @@ struct class_ro_t {
             ro->_swiftMetadataInitializer_NEVER_USE[0] = this->_swiftMetadataInitializer_NEVER_USE[0];
 
 #if __has_feature(ptrauth_calls)
-        // Re-sign the method list pointer if it was signed.
-        // NOTE: It is possible for a signed pointer to have a signature
-        // that is all zeroes. This is indistinguishable from a raw pointer.
-        // This code will treat such a pointer as signed and re-sign it. A
-        // false positive is safe: method list pointers are either authed or
-        // stripped, so if baseMethods() doesn't expect it to be signed, it
-        // will ignore the signature.
-        void *strippedBaseMethodList = ptrauth_strip(baseMethodList, ptrauth_key_method_list_pointer);
-        void *signedBaseMethodList = ptrauth_sign_unauthenticated(strippedBaseMethodList,
-                                                                  ptrauth_key_method_list_pointer,
-                                                                  baseMethodListPtrauthData());
-        if (baseMethodList == signedBaseMethodList) {
-            ro->baseMethodList = ptrauth_auth_and_resign(baseMethodList,
-                                                         ptrauth_key_method_list_pointer,
-                                                         baseMethodListPtrauthData(),
-                                                         ptrauth_key_method_list_pointer,
-                                                         ro->baseMethodListPtrauthData());
-        } else {
-            // Special case: a class_ro_t in the shared cache pointing to a
-            // method list in the shared cache will not have a signed pointer,
-            // but the duplicate will be expected to have a signed pointer since
-            // it's not in the shared cache. Detect that and sign it.
-            bool roInSharedCache = objc::inSharedCache((uintptr_t)this);
-            bool listInSharedCache = objc::inSharedCache((uintptr_t)strippedBaseMethodList);
-            if (roInSharedCache && listInSharedCache)
-                ro->baseMethodList = ptrauth_sign_unauthenticated(strippedBaseMethodList,
-                                                                  ptrauth_key_method_list_pointer,
-                                                                  ro->baseMethodListPtrauthData());
-        }
+        // Re-sign the method list pointer.
+        ro->baseMethods = baseMethods;
 #endif
 
         return ro;
@@ -1203,18 +1489,32 @@ class list_array_tt {
     };
 
  protected:
-    class iterator {
+    template <bool authenticated>
+    class iteratorImpl {
         const Ptr<List> *lists;
         const Ptr<List> *listsEnd;
-        typename List::iterator m, mEnd;
+
+        template<bool B>
+        struct ListIterator {
+            using Type = typename List::signedIterator;
+            static Type begin(Ptr<List> ptr) { return ptr->signedBegin(); }
+            static Type end(Ptr<List> ptr) { return ptr->signedEnd(); }
+        };
+        template<>
+        struct ListIterator<false> {
+            using Type = typename List::iterator;
+            static Type begin(Ptr<List> ptr) { return ptr->begin(); }
+            static Type end(Ptr<List> ptr) { return ptr->end(); }
+        };
+        typename ListIterator<authenticated>::Type m, mEnd;
 
      public:
-        iterator(const Ptr<List> *begin, const Ptr<List> *end)
+        iteratorImpl(const Ptr<List> *begin, const Ptr<List> *end)
             : lists(begin), listsEnd(end)
         {
             if (begin != end) {
-                m = (*begin)->begin();
-                mEnd = (*begin)->end();
+                m = ListIterator<authenticated>::begin(*begin);
+                mEnd = ListIterator<authenticated>::end(*begin);
             }
         }
 
@@ -1225,27 +1525,29 @@ class list_array_tt {
             return *m;
         }
 
-        bool operator != (const iterator& rhs) const {
+        bool operator != (const iteratorImpl& rhs) const {
             if (lists != rhs.lists) return true;
             if (lists == listsEnd) return false;  // m is undefined
             if (m != rhs.m) return true;
             return false;
         }
 
-        const iterator& operator ++ () {
+        const iteratorImpl& operator ++ () {
             ASSERT(m != mEnd);
             m++;
             if (m == mEnd) {
                 ASSERT(lists != listsEnd);
                 lists++;
                 if (lists != listsEnd) {
-                    m = (*lists)->begin();
-                    mEnd = (*lists)->end();
+                    m = ListIterator<authenticated>::begin(*lists);
+                    mEnd = ListIterator<authenticated>::end(*lists);
                 }
             }
             return *this;
         }
     };
+    using iterator = iteratorImpl<false>;
+    using signedIterator = iteratorImpl<true>;
 
  private:
     union {
@@ -1288,7 +1590,7 @@ class list_array_tt {
 
     uint32_t count() const {
         uint32_t result = 0;
-        for (auto lists = beginLists(), end = endLists(); 
+        for (auto lists = beginLists(), end = endLists();
              lists != end;
              ++lists)
         {
@@ -1304,6 +1606,15 @@ class list_array_tt {
     iterator end() const {
         auto e = endLists();
         return iterator(e, e);
+    }
+
+    signedIterator signedBegin() const {
+        return signedIterator(beginLists(), endLists());
+    }
+
+    signedIterator signedEnd() const {
+        auto e = endLists();
+        return signedIterator(e, e);
     }
 
     inline uint32_t countLists(const std::function<const array_t * (const array_t *)> & peek) const {
@@ -1361,7 +1672,7 @@ class list_array_tt {
             // 0 lists -> 1 list
             list = addedLists[0];
             validate();
-        } 
+        }
         else {
             // 1 list -> many lists
             Ptr<List> oldList = list;
@@ -1379,12 +1690,12 @@ class list_array_tt {
     void tryFree() {
         if (hasArray()) {
             for (uint32_t i = 0; i < array()->count; i++) {
-                try_free(array()->lists[i]);
+                try_free(stripTBI(array()->lists[i]));
             }
             try_free(array());
         }
         else if (list) {
-            try_free(list);
+            try_free(stripTBI(list));
         }
     }
 
@@ -1407,7 +1718,7 @@ class list_array_tt {
 
 DECLARE_AUTHED_PTR_TEMPLATE(method_list_t)
 
-class method_array_t : 
+class method_array_t :
     public list_array_tt<method_t, method_list_t, method_list_t_authed_ptr>
 {
     typedef list_array_tt<method_t, method_list_t, method_list_t_authed_ptr> Super;
@@ -1419,12 +1730,12 @@ class method_array_t :
     const method_list_t_authed_ptr<method_list_t> *beginCategoryMethodLists() const {
         return beginLists();
     }
-    
+
     const method_list_t_authed_ptr<method_list_t> *endCategoryMethodLists(Class cls) const;
 };
 
 
-class property_array_t : 
+class property_array_t :
     public list_array_tt<property_t, property_list_t, RawPtr>
 {
     typedef list_array_tt<property_t, property_list_t, RawPtr> Super;
@@ -1435,7 +1746,7 @@ class property_array_t :
 };
 
 
-class protocol_array_t : 
+class protocol_array_t :
     public list_array_tt<protocol_ref_t, protocol_list_t, RawPtr>
 {
     typedef list_array_tt<protocol_ref_t, protocol_list_t, RawPtr> Super;
@@ -1451,7 +1762,7 @@ struct class_rw_ext_t {
     method_array_t methods;
     property_array_t properties;
     protocol_array_t protocols;
-    char *demangledName;
+    const char *demangledName;
     uint32_t version;
 };
 
@@ -1494,13 +1805,13 @@ public:
         __c11_atomic_fetch_or((_Atomic(uint32_t) *)&flags, set, __ATOMIC_RELAXED);
     }
 
-    void clearFlags(uint32_t clear) 
+    void clearFlags(uint32_t clear)
     {
         __c11_atomic_fetch_and((_Atomic(uint32_t) *)&flags, ~clear, __ATOMIC_RELAXED);
     }
 
     // set and clear must not overlap
-    void changeFlags(uint32_t set, uint32_t clear) 
+    void changeFlags(uint32_t set, uint32_t clear)
     {
         ASSERT((set & clear) == 0);
 
@@ -1508,7 +1819,7 @@ public:
         do {
             oldf = flags;
             newf = (oldf | set) & ~clear;
-        } while (!OSAtomicCompareAndSwap32Barrier(oldf, newf, (volatile int32_t *)&flags));
+        } while (!CompareAndSwap(oldf, newf, &flags));
     }
 
     class_rw_ext_t *ext() const {
@@ -1550,7 +1861,7 @@ public:
         if (v.is<class_rw_ext_t *>()) {
             return v.get<class_rw_ext_t *>(&ro_or_rw_ext)->methods;
         } else {
-            return method_array_t{v.get<const class_ro_t *>(&ro_or_rw_ext)->baseMethods()};
+            return method_array_t{v.get<const class_ro_t *>(&ro_or_rw_ext)->baseMethods};
         }
     }
 
@@ -1573,6 +1884,9 @@ public:
     }
 };
 
+namespace objc {
+    extern uintptr_t ptrauth_class_rx_enforce disableEnforceClassRXPtrAuth;
+}
 
 struct class_data_bits_t {
     friend objc_class;
@@ -1586,52 +1900,168 @@ private:
     }
 
     // Atomically set the bits in `set` and clear the bits in `clear`.
-    // set and clear must not overlap.
+    // set and clear must not overlap.  If the existing bits field is zero,
+    // this function will mark it as using the RW signing scheme.
     void setAndClearBits(uintptr_t set, uintptr_t clear)
     {
         ASSERT((set & clear) == 0);
         uintptr_t newBits, oldBits = LoadExclusive(&bits);
         do {
-            newBits = (oldBits | set) & ~clear;
+            uintptr_t authBits
+                = (oldBits
+                   ? (uintptr_t)ptrauth_auth_data((class_rw_t *)oldBits,
+                                                  CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                  ptrauth_blend_discriminator(&bits,
+                                                                              CLASS_DATA_BITS_RW_DISCRIMINATOR))
+                   : FAST_IS_RW_POINTER);
+            newBits = (authBits | set) & ~clear;
+            newBits = (uintptr_t)ptrauth_sign_unauthenticated((class_rw_t *)newBits,
+                                                              CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                              ptrauth_blend_discriminator(&bits,
+                                                                                          CLASS_DATA_BITS_RW_DISCRIMINATOR));
         } while (slowpath(!StoreReleaseExclusive(&bits, &oldBits, newBits)));
     }
 
     void setBits(uintptr_t set) {
-        __c11_atomic_fetch_or((_Atomic(uintptr_t) *)&bits, set, __ATOMIC_RELAXED);
+        setAndClearBits(set, 0);
     }
 
     void clearBits(uintptr_t clear) {
-        __c11_atomic_fetch_and((_Atomic(uintptr_t) *)&bits, ~clear, __ATOMIC_RELAXED);
+        setAndClearBits(0, clear);
     }
 
 public:
 
+    void copyRWFrom(const class_data_bits_t &other) {
+        bits = (uintptr_t)ptrauth_auth_and_resign((class_rw_t *)other.bits,
+                                                  CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                  ptrauth_blend_discriminator(&other.bits,
+                                                                              CLASS_DATA_BITS_RW_DISCRIMINATOR),
+                                                  CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                  ptrauth_blend_discriminator(&bits,
+                                                                              CLASS_DATA_BITS_RW_DISCRIMINATOR));
+    }
+
+    void copyROFrom(const class_data_bits_t &other, bool authenticate) {
+        ASSERT((flags() & RO_REALIZED) == 0);
+        if (authenticate) {
+            bits = (uintptr_t)ptrauth_auth_and_resign((class_ro_t *)other.bits,
+                                                      CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                      ptrauth_blend_discriminator(&other.bits,
+                                                                                  CLASS_DATA_BITS_RO_DISCRIMINATOR),
+                                                      CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                      ptrauth_blend_discriminator(&bits,
+                                                                                  CLASS_DATA_BITS_RO_DISCRIMINATOR));
+        } else {
+            bits = other.bits;
+        }
+    }
+
     class_rw_t* data() const {
-        return (class_rw_t *)(bits & FAST_DATA_MASK);
+#if __BUILDING_OBJCDT__
+        return (class_rw_t *)((uintptr_t)ptrauth_strip((class_rw_t *)bits,
+                                                           CLASS_DATA_BITS_RW_SIGNING_KEY) & FAST_DATA_MASK);
+#else
+        return (class_rw_t *)((uintptr_t)ptrauth_auth_data((class_rw_t *)bits,
+                                                           CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                           ptrauth_blend_discriminator(&bits,
+                                                                                       CLASS_DATA_BITS_RW_DISCRIMINATOR)) & FAST_DATA_MASK);
+#endif
+
     }
     void setData(class_rw_t *newData)
     {
-        ASSERT(!data()  ||  (newData->flags & (RW_REALIZING | RW_FUTURE)));
+        ASSERT(!(bits & FAST_IS_RW_POINTER)
+               || (newData->flags & (RW_REALIZING | RW_FUTURE)));
+
+        uintptr_t authedBits;
+
+        if (objc::disableEnforceClassRXPtrAuth) {
+            authedBits = (uintptr_t)ptrauth_strip((const void *)bits,
+                                                  CLASS_DATA_BITS_RW_SIGNING_KEY);
+        } else {
+            if (!bits)
+                authedBits = 0;
+            else if (bits & FAST_IS_RW_POINTER) {
+                authedBits = (uintptr_t)ptrauth_auth_data((class_rw_t *)bits,
+                                                          CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                                          ptrauth_blend_discriminator(&bits,
+                                                                                      CLASS_DATA_BITS_RW_DISCRIMINATOR));
+            } else {
+                authedBits = (uintptr_t)ptrauth_auth_data((class_ro_t *)bits,
+                                                          CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                          ptrauth_blend_discriminator(&bits,
+                                                                                      CLASS_DATA_BITS_RO_DISCRIMINATOR));
+            }
+        }
+
         // Set during realization or construction only. No locking needed.
         // Use a store-release fence because there may be concurrent
         // readers of data and data's contents.
-        uintptr_t newBits = (bits & ~FAST_DATA_MASK) | (uintptr_t)newData;
+        uintptr_t newBits = ((authedBits & FAST_FLAGS_MASK)
+                             | (uintptr_t)newData
+                             | FAST_IS_RW_POINTER);
+        class_rw_t *signedData
+            = ptrauth_sign_unauthenticated((class_rw_t *)newBits,
+                                           CLASS_DATA_BITS_RW_SIGNING_KEY,
+                                           ptrauth_blend_discriminator(&bits,
+                                                                       CLASS_DATA_BITS_RW_DISCRIMINATOR));
         atomic_thread_fence(memory_order_release);
-        bits = newBits;
+        bits = (uintptr_t)signedData;
     }
 
     // Get the class's ro data, even in the presence of concurrent realization.
     // fixme this isn't really safe without a compiler barrier at least
     // and probably a memory barrier when realizeClass changes the data field
+    template <Authentication authentication = Authentication::Authenticate>
     const class_ro_t *safe_ro() const {
-        class_rw_t *maybe_rw = data();
+#if FAST_IS_RW_POINTER
+        if (bits & FAST_IS_RW_POINTER) {
+            return data()->ro();
+        } else {
+            uintptr_t authedBits;
+            if (authentication == Authentication::Strip || objc::disableEnforceClassRXPtrAuth) {
+                authedBits = (uintptr_t)ptrauth_strip((const void *)bits,
+                                                      CLASS_DATA_BITS_RO_SIGNING_KEY);
+            } else {
+                authedBits = (uintptr_t)ptrauth_auth_data((const void *)bits,
+                                                          CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                          ptrauth_blend_discriminator(&bits,
+                                                                                      CLASS_DATA_BITS_RO_DISCRIMINATOR));
+            }
+            return (const class_ro_t *)(authedBits & FAST_DATA_MASK);
+        }
+#else
+        class_rw_t *maybe_rw = (class_rw_t *)(bits & FAST_DATA_MASK);
         if (maybe_rw->flags & RW_REALIZED) {
             // maybe_rw is rw
-            return maybe_rw->ro();
+            return data()->ro();
         } else {
             // maybe_rw is actually ro
             return (class_ro_t *)maybe_rw;
         }
+#endif
+    }
+
+    // This intentionally DOES NOT check the signatures
+    uint32_t flags() const {
+        static_assert(offsetof(class_rw_t, flags) == 0
+                      && offsetof(class_ro_t, flags) == 0, "flags at start");
+#if FAST_IS_RW_POINTER
+        const uint32_t *pflags;
+        if (bits & FAST_IS_RW_POINTER) {
+            pflags = ptrauth_strip((const uint32_t *)bits,
+                                   CLASS_DATA_BITS_RW_SIGNING_KEY);
+        } else {
+            pflags = ptrauth_strip((const uint32_t *)bits,
+                                   CLASS_DATA_BITS_RO_SIGNING_KEY);
+        }
+        pflags = (const uint32_t *)((uintptr_t)pflags & FAST_DATA_MASK);
+
+        return *pflags;
+#else
+        return *(const uint32_t *)(bits & FAST_DATA_MASK);
+#endif
     }
 
 #if SUPPORT_INDEXED_ISA
@@ -1669,6 +2099,30 @@ public:
     }
     void setIsSwiftLegacy() {
         setAndClearBits(FAST_IS_SWIFT_LEGACY, FAST_IS_SWIFT_STABLE);
+    }
+
+    // Only for use on unrealized classes
+    void setIsSwiftStableRO() {
+        uintptr_t authedBits;
+
+        ASSERT(!(bits & FAST_IS_RW_POINTER));
+
+        if (objc::disableEnforceClassRXPtrAuth) {
+            authedBits = (uintptr_t)ptrauth_strip((const void *)bits,
+                                                  CLASS_DATA_BITS_RO_SIGNING_KEY);
+        } else {
+            authedBits = (uintptr_t)ptrauth_auth_data((class_ro_t *)bits,
+                                                      CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                      ptrauth_blend_discriminator(&bits,
+                                                                                      CLASS_DATA_BITS_RO_DISCRIMINATOR));
+        }
+
+        uintptr_t newBits = ((authedBits & ~FAST_IS_SWIFT_LEGACY)
+                             | FAST_IS_SWIFT_STABLE);
+        bits = (uintptr_t)ptrauth_sign_unauthenticated((class_ro_t *)newBits,
+                                                       CLASS_DATA_BITS_RO_SIGNING_KEY,
+                                                       ptrauth_blend_discriminator(&bits,
+                                                                                   CLASS_DATA_BITS_RO_DISCRIMINATOR));
     }
 
     // fixme remove this once the Swift runtime uses the stable bits
@@ -1709,7 +2163,7 @@ struct objc_class : objc_object {
                 return Nil;
         }
 #endif
-            
+
         void *result = ptrauth_auth_data((void *)superclass, ISA_SIGNING_KEY, ptrauth_blend_discriminator(&superclass, ISA_SIGNING_DISCRIMINATOR_CLASS_SUPERCLASS));
         return (Class)result;
 
@@ -1734,6 +2188,10 @@ struct objc_class : objc_object {
     }
     void setData(class_rw_t *newData) {
         bits.setData(newData);
+    }
+
+    const class_ro_t *safe_ro() const {
+        return bits.safe_ro();
     }
 
     void setInfo(uint32_t set) {
@@ -1772,6 +2230,24 @@ struct objc_class : objc_object {
     }
     void setHasCustomRR() {
         bits.data()->clearFlags(RW_HAS_DEFAULT_RR);
+    }
+#endif
+
+#if FAST_CACHE_HAS_CUSTOM_DEALLOC_INITIATION
+    bool hasCustomDeallocInitiation() const {
+        return cache.getBit(FAST_CACHE_HAS_CUSTOM_DEALLOC_INITIATION);
+    }
+
+    void setHasCustomDeallocInitiation() {
+        cache.setBit(FAST_CACHE_HAS_CUSTOM_DEALLOC_INITIATION);
+    }
+#else
+    bool hasCustomDeallocInitiation() const {
+        return false;
+    }
+
+    void setHasCustomDeallocInitiation() {
+        _objc_fatal("_class_setCustomDeallocInitiation is not supported on this target");
     }
 #endif
 
@@ -1928,7 +2404,7 @@ struct objc_class : objc_object {
     uint32_t swiftClassFlags() {
         return *(uint32_t *)(&bits + 1);
     }
-  
+
     bool usesSwiftRefcounting() {
         if (!isSwiftStable()) return false;
         return bool(swiftClassFlags() & 2); //ClassFlags::UsesSwiftRefcounting
@@ -1974,7 +2450,11 @@ struct objc_class : objc_object {
         if (isUnfixedBackwardDeployingStableSwift()) {
             // Class really is stable Swift, pretending to be pre-stable.
             // Fix its lie.
-            bits.setIsSwiftStable();
+
+            // N.B. At this point, bits is *always* a class_ro pointer; we
+            // can't use setIsSwiftStable() because that only works for a
+            // class_rw pointer.
+            bits.setIsSwiftStableRO();
         }
     }
 
@@ -1982,7 +2462,7 @@ struct objc_class : objc_object {
         return bits.swiftMetadataInitializer();
     }
 
-    // Return YES if the class's ivars are managed by ARC, 
+    // Return YES if the class's ivars are managed by ARC,
     // or the class is MRC but has ARC-style weak ivars.
     bool hasAutomaticIvars() {
         return data()->ro()->flags & (RO_IS_ARC | RO_HAS_WEAK_WITHOUT_ARC);
@@ -2023,7 +2503,7 @@ struct objc_class : objc_object {
     }
 
     bool isInitializing() {
-        return getMeta()->data()->flags & RW_INITIALIZING;
+        return getMeta()->bits.flags() & RW_INITIALIZING;
     }
 
     void setInitializing() {
@@ -2032,7 +2512,7 @@ struct objc_class : objc_object {
     }
 
     bool isInitialized() {
-        return getMeta()->data()->flags & RW_INITIALIZED;
+        return getMeta()->bits.flags() & RW_INITIALIZED;
     }
 
     void setInitialized();
@@ -2046,7 +2526,7 @@ struct objc_class : objc_object {
 
     // Locking: To prevent concurrent realization, hold runtimeLock.
     bool isRealized() const {
-        return !isStubClass() && (data()->flags & RW_REALIZED);
+        return !isStubClass() && (bits.flags() & RW_REALIZED);
     }
 
     // Returns true if this is an unrealized future class.
@@ -2054,7 +2534,7 @@ struct objc_class : objc_object {
     bool isFuture() const {
         if (isStubClass())
             return false;
-        return data()->flags & RW_FUTURE;
+        return bits.flags() & RW_FUTURE;
     }
 
     bool isMetaClass() const {
@@ -2073,7 +2553,7 @@ struct objc_class : objc_object {
         static_assert(RO_META == RW_META, "flags alias");
         if (isStubClass())
             return false;
-        return data()->flags & RW_META;
+        return bits.flags() & RW_META;
     }
 
     // NOT identical to this->ISA when this is a metaclass
@@ -2088,7 +2568,7 @@ struct objc_class : objc_object {
     bool isRootMetaclass() {
         return ISA() == (Class)this;
     }
-  
+
     // If this class does not have a name already, we can ask Swift to construct one for us.
     const char *installMangledNameForLazilyNamedClass();
 
@@ -2098,7 +2578,7 @@ struct objc_class : objc_object {
         return bits.safe_ro()->getName();
     }
 
-    const char *mangledName() { 
+    const char *mangledName() {
         // fixme can't assert locks here
         ASSERT_THIS_NOT_NULL;
 
@@ -2112,7 +2592,17 @@ struct objc_class : objc_object {
 
         return result;
     }
-    
+
+    // Get the class's mangled name, or NULL if it has a lazy name that hasn't
+    // been created yet, WITHOUT authenticating the signed class_ro pointer.
+    // This exists sosely for objc_debug_class_getNameRaw to use.
+    const char *rawUnsafeMangledName() const {
+        // Strip the class_ro pointer instead of authenticating so that we can
+        // handle classes without signed class_ro pointers in the shared cache
+        // even if they haven't been officially loaded yet. rdar://90415774
+        return bits.safe_ro<Authentication::Strip>()->getName();
+    }
+
     const char *demangledName(bool needsLock);
     const char *nameForLogging();
 
@@ -2194,8 +2684,8 @@ struct swift_class_t : objc_class {
 struct category_t {
     const char *name;
     classref_t cls;
-    WrappedPtr<method_list_t, PtrauthStrip> instanceMethods;
-    WrappedPtr<method_list_t, PtrauthStrip> classMethods;
+    WrappedPtr<method_list_t, method_list_t::Ptrauth> instanceMethods;
+    WrappedPtr<method_list_t, method_list_t::Ptrauth> classMethods;
     struct protocol_list_t *protocols;
     struct property_list_t *instanceProperties;
     // Fields below this point are not always present on disk.
@@ -2207,7 +2697,7 @@ struct category_t {
     }
 
     property_list_t *propertiesForMeta(bool isMeta, struct header_info *hi);
-    
+
     protocol_list_t *protocolsForMeta(bool isMeta) {
         if (isMeta) return nullptr;
         else return protocols;

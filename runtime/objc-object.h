@@ -37,14 +37,14 @@ enum ReturnDisposition : bool {
 };
 
 static ALWAYS_INLINE 
-bool prepareOptimizedReturn(ReturnDisposition disposition);
+bool prepareOptimizedReturn(id obj, bool cameFromRootAutorelease, ReturnDisposition disposition);
 
 
 #if SUPPORT_TAGGED_POINTERS
 
 extern "C" { 
-    extern Class objc_debug_taggedpointer_classes[_OBJC_TAG_SLOT_COUNT];
-    extern Class objc_debug_taggedpointer_ext_classes[_OBJC_TAG_EXT_SLOT_COUNT];
+    extern ptrauth_taggedpointer_table_entry Class objc_debug_taggedpointer_classes[_OBJC_TAG_SLOT_COUNT];
+    extern ptrauth_taggedpointer_table_entry Class objc_debug_taggedpointer_ext_classes[_OBJC_TAG_EXT_SLOT_COUNT];
 }
 #define objc_tag_classes objc_debug_taggedpointer_classes
 #define objc_tag_ext_classes objc_debug_taggedpointer_ext_classes
@@ -76,7 +76,7 @@ objc_object::isClass()
 inline Class
 objc_object::getIsa() 
 {
-    if (fastpath(!isTaggedPointer())) return ISA();
+    if (fastpath(!isTaggedPointer())) return ISA(/*authenticated*/true);
 
     extern objc_class OBJC_CLASS_$___NSUnrecognizedTaggedPointer;
     uintptr_t slot, ptr = (uintptr_t)this;
@@ -94,19 +94,13 @@ objc_object::getIsa()
 inline uintptr_t
 objc_object::isaBits() const
 {
-    return isa.bits;
+    return isa().bits;
 }
 
 inline bool 
 objc_object::isTaggedPointer() 
 {
     return _objc_isTaggedPointer(this);
-}
-
-inline bool
-objc_object::isTaggedPointerOrNil()
-{
-    return _objc_isTaggedPointerOrNil(this);
 }
 
 inline bool 
@@ -136,7 +130,7 @@ objc_object::getIsa()
 inline uintptr_t
 objc_object::isaBits() const
 {
-    return isa.bits;
+    return isa().bits;
 }
 
 
@@ -144,12 +138,6 @@ inline bool
 objc_object::isTaggedPointer() 
 {
     return false;
-}
-
-inline bool
-objc_object::isTaggedPointerOrNil()
-{
-    return !this;
 }
 
 inline bool 
@@ -280,20 +268,20 @@ inline Class
 objc_object::ISA(bool authenticated)
 {
     ASSERT(!isTaggedPointer());
-    return isa.getDecodedClass(authenticated);
+    return isa().getDecodedClass(authenticated);
 }
 
 inline Class
 objc_object::rawISA()
 {
-    ASSERT(!isTaggedPointer() && !isa.nonpointer);
-    return (Class)isa.bits;
+    ASSERT(!isTaggedPointer() && !isa().nonpointer);
+    return (Class)isa().bits;
 }
 
 inline bool 
 objc_object::hasNonpointerIsa()
 {
-    return isa.nonpointer;
+    return isa().nonpointer;
 }
 
 
@@ -373,9 +361,8 @@ objc_object::initIsa(Class cls, bool nonpointer, UNUSED_WITHOUT_INDEXED_ISA_AND_
     // fixme use atomics here to guarantee single-store and to
     // guarantee memory order w.r.t. the class index table
     // ...but not too atomic because we don't want to hurt instantiation
-    isa = newisa;
+    isa() = newisa;
 }
-
 
 inline Class 
 objc_object::changeIsa(Class newCls)
@@ -393,7 +380,7 @@ objc_object::changeIsa(Class newCls)
     bool sideTableLocked = false;
     bool transcribeToSideTable = false;
 
-    oldisa = LoadExclusive(&isa.bits);
+    oldisa = LoadExclusive(&isa().bits);
 
     do {
         transcribeToSideTable = false;
@@ -444,7 +431,7 @@ objc_object::changeIsa(Class newCls)
             // raw pointer -> raw pointer
             newisa.setClass(newCls, this);
         }
-    } while (slowpath(!StoreExclusive(&isa.bits, &oldisa.bits, newisa.bits)));
+    } while (slowpath(!StoreExclusive(&isa().bits, &oldisa.bits, newisa.bits)));
 
     if (transcribeToSideTable) {
         // Copy oldisa's retain count et al to side table.
@@ -464,7 +451,7 @@ inline bool
 objc_object::hasAssociatedObjects()
 {
     if (isTaggedPointer()) return true;
-    if (isa.nonpointer) return isa.has_assoc;
+    if (isa().nonpointer) return isa().has_assoc;
     return true;
 }
 
@@ -481,15 +468,15 @@ objc_object::setHasAssociatedObjects()
         }
     }
 
-    isa_t newisa, oldisa = LoadExclusive(&isa.bits);
+    isa_t newisa, oldisa = LoadExclusive(&isa().bits);
     do {
         newisa = oldisa;
         if (!newisa.nonpointer  ||  newisa.has_assoc) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return;
         }
         newisa.has_assoc = true;
-    } while (slowpath(!StoreExclusive(&isa.bits, &oldisa.bits, newisa.bits)));
+    } while (slowpath(!StoreExclusive(&isa().bits, &oldisa.bits, newisa.bits)));
 }
 
 
@@ -497,7 +484,7 @@ inline bool
 objc_object::isWeaklyReferenced()
 {
     ASSERT(!isTaggedPointer());
-    if (isa.nonpointer) return isa.weakly_referenced;
+    if (isa().nonpointer) return isa().weakly_referenced;
     else return sidetable_isWeaklyReferenced();
 }
 
@@ -505,20 +492,31 @@ objc_object::isWeaklyReferenced()
 inline void
 objc_object::setWeaklyReferenced_nolock()
 {
-    isa_t newisa, oldisa = LoadExclusive(&isa.bits);
+    isa_t newisa, oldisa = LoadExclusive(&isa().bits);
     do {
         newisa = oldisa;
         if (slowpath(!newisa.nonpointer)) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             sidetable_setWeaklyReferenced_nolock();
             return;
         }
         if (newisa.weakly_referenced) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return;
         }
         newisa.weakly_referenced = true;
-    } while (slowpath(!StoreExclusive(&isa.bits, &oldisa.bits, newisa.bits)));
+    } while (slowpath(!StoreExclusive(&isa().bits, &oldisa.bits, newisa.bits)));
+}
+
+
+inline bool
+objc_object::isUniquelyReferenced()
+{
+    ASSERT(!isTaggedPointer());
+    if (fastpath(!ISA()->hasCustomRR())) {
+        return rootRetainCount() == 1;
+    }
+    return ((NSUInteger(*)(objc_object *, SEL))objc_msgSend)(this, @selector(retainCount)) == 1;
 }
 
 
@@ -527,8 +525,8 @@ objc_object::hasCxxDtor()
 {
     ASSERT(!isTaggedPointer());
 #if ISA_HAS_CXX_DTOR_BIT
-    if (isa.nonpointer)
-        return isa.has_cxx_dtor;
+    if (isa().nonpointer)
+        return isa().has_cxx_dtor;
     else
 #endif
         return ISA()->hasCxxDtor();
@@ -540,7 +538,7 @@ inline bool
 objc_object::rootIsDeallocating()
 {
     if (isTaggedPointer()) return false;
-    if (isa.nonpointer) return isa.isDeallocating();
+    if (isa().nonpointer) return isa().isDeallocating();
     return sidetable_isDeallocating();
 }
 
@@ -548,11 +546,11 @@ objc_object::rootIsDeallocating()
 inline void 
 objc_object::clearDeallocating()
 {
-    if (slowpath(!isa.nonpointer)) {
+    if (slowpath(!isa().nonpointer)) {
         // Slow path for raw pointer isa.
         sidetable_clearDeallocating();
     }
-    else if (slowpath(isa.weakly_referenced  ||  isa.has_sidetable_rc)) {
+    else if (slowpath(isa().weakly_referenced  ||  isa().has_sidetable_rc)) {
         // Slow path for non-pointer isa with weak refs and/or side table data.
         clearDeallocating_slow();
     }
@@ -566,15 +564,15 @@ objc_object::rootDealloc()
 {
     if (isTaggedPointer()) return;  // fixme necessary?
 
-    if (fastpath(isa.nonpointer                     &&
-                 !isa.weakly_referenced             &&
-                 !isa.has_assoc                     &&
+    if (fastpath(isa().nonpointer                     &&
+                 !isa().weakly_referenced             &&
+                 !isa().has_assoc                     &&
 #if ISA_HAS_CXX_DTOR_BIT
-                 !isa.has_cxx_dtor                  &&
+                 !isa().has_cxx_dtor                  &&
 #else
-                 !isa.getClass(false)->hasCxxDtor() &&
+                 !isa().getClass(false)->hasCxxDtor() &&
 #endif
-                 !isa.has_sidetable_rc))
+                 !isa().has_sidetable_rc))
     {
         assert(!sidetable_present());
         free(this);
@@ -628,13 +626,13 @@ objc_object::rootRetain(bool tryRetain, objc_object::RRVariant variant)
     isa_t oldisa;
     isa_t newisa;
 
-    oldisa = LoadExclusive(&isa.bits);
+    oldisa = LoadExclusive(&isa().bits);
 
     if (variant == RRVariant::FastOrMsgSend) {
         // These checks are only meaningful for objc_retain()
         // They are here so that we avoid a re-load of the isa.
         if (slowpath(oldisa.getDecodedClass(false)->hasCustomRR())) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             if (oldisa.getDecodedClass(false)->canCallSwiftRR()) {
                 return swiftRetain.load(memory_order_relaxed)((id)this);
             }
@@ -646,7 +644,7 @@ objc_object::rootRetain(bool tryRetain, objc_object::RRVariant variant)
         // a Class is a Class forever, so we can perform this check once
         // outside of the CAS loop
         if (oldisa.getDecodedClass(false)->isMetaClass()) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return (id)this;
         }
     }
@@ -655,13 +653,13 @@ objc_object::rootRetain(bool tryRetain, objc_object::RRVariant variant)
         transcribeToSideTable = false;
         newisa = oldisa;
         if (slowpath(!newisa.nonpointer)) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             if (tryRetain) return sidetable_tryRetain() ? (id)this : nil;
             else return sidetable_retain(sideTableLocked);
         }
         // don't check newisa.fast_rr; we already called any RR overrides
         if (slowpath(newisa.isDeallocating())) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             if (sideTableLocked) {
                 ASSERT(variant == RRVariant::Full);
                 sidetable_unlock();
@@ -678,7 +676,7 @@ objc_object::rootRetain(bool tryRetain, objc_object::RRVariant variant)
         if (slowpath(carry)) {
             // newisa.extra_rc++ overflowed
             if (variant != RRVariant::Full) {
-                ClearExclusive(&isa.bits);
+                ClearExclusive(&isa().bits);
                 return rootRetain_overflow(tryRetain);
             }
             // Leave half of the retain counts inline and 
@@ -689,7 +687,7 @@ objc_object::rootRetain(bool tryRetain, objc_object::RRVariant variant)
             newisa.extra_rc = RC_HALF;
             newisa.has_sidetable_rc = true;
         }
-    } while (slowpath(!StoreExclusive(&isa.bits, &oldisa.bits, newisa.bits)));
+    } while (slowpath(!StoreExclusive(&isa().bits, &oldisa.bits, newisa.bits)));
 
     if (variant == RRVariant::Full) {
         if (slowpath(transcribeToSideTable)) {
@@ -748,13 +746,13 @@ objc_object::rootRelease(bool performDealloc, objc_object::RRVariant variant)
 
     isa_t newisa, oldisa;
 
-    oldisa = LoadExclusive(&isa.bits);
+    oldisa = LoadExclusive(&isa().bits);
 
     if (variant == RRVariant::FastOrMsgSend) {
         // These checks are only meaningful for objc_release()
         // They are here so that we avoid a re-load of the isa.
         if (slowpath(oldisa.getDecodedClass(false)->hasCustomRR())) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             if (oldisa.getDecodedClass(false)->canCallSwiftRR()) {
                 swiftRelease.load(memory_order_relaxed)((id)this);
                 return true;
@@ -768,7 +766,7 @@ objc_object::rootRelease(bool performDealloc, objc_object::RRVariant variant)
         // a Class is a Class forever, so we can perform this check once
         // outside of the CAS loop
         if (oldisa.getDecodedClass(false)->isMetaClass()) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return false;
         }
     }
@@ -777,11 +775,11 @@ retry:
     do {
         newisa = oldisa;
         if (slowpath(!newisa.nonpointer)) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return sidetable_release(sideTableLocked, performDealloc);
         }
         if (slowpath(newisa.isDeallocating())) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             if (sideTableLocked) {
                 ASSERT(variant == RRVariant::Full);
                 sidetable_unlock();
@@ -796,7 +794,7 @@ retry:
             // don't ClearExclusive()
             goto underflow;
         }
-    } while (slowpath(!StoreReleaseExclusive(&isa.bits, &oldisa.bits, newisa.bits)));
+    } while (slowpath(!StoreReleaseExclusive(&isa().bits, &oldisa.bits, newisa.bits)));
 
     if (slowpath(newisa.isDeallocating()))
         goto deallocate;
@@ -816,19 +814,19 @@ retry:
 
     if (slowpath(newisa.has_sidetable_rc)) {
         if (variant != RRVariant::Full) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             return rootRelease_underflow(performDealloc);
         }
 
         // Transfer retain count from side table to inline storage.
 
         if (!sideTableLocked) {
-            ClearExclusive(&isa.bits);
+            ClearExclusive(&isa().bits);
             sidetable_lock();
             sideTableLocked = true;
             // Need to start over to avoid a race against 
             // the nonpointer -> raw pointer transition.
-            oldisa = LoadExclusive(&isa.bits);
+            oldisa = LoadExclusive(&isa().bits);
             goto retry;
         }
 
@@ -844,7 +842,7 @@ retry:
             newisa.extra_rc = borrow.borrowed - 1;  // redo the original decrement too
             newisa.has_sidetable_rc = !emptySideTable;
 
-            bool stored = StoreReleaseExclusive(&isa.bits, &oldisa.bits, newisa.bits);
+            bool stored = StoreReleaseExclusive(&isa().bits, &oldisa.bits, newisa.bits);
 
             if (!stored && oldisa.nonpointer) {
                 // Inline update failed. 
@@ -856,7 +854,7 @@ retry:
                     addc(oldisa.bits, RC_ONE * (borrow.borrowed-1), 0, &overflow);
                 newisa.has_sidetable_rc = !emptySideTable;
                 if (!overflow) {
-                    stored = StoreReleaseExclusive(&isa.bits, &oldisa.bits, newisa.bits);
+                    stored = StoreReleaseExclusive(&isa().bits, &oldisa.bits, newisa.bits);
                     if (stored) {
                         didTransitionToDeallocating = newisa.isDeallocating();
                     }
@@ -866,9 +864,9 @@ retry:
             if (!stored) {
                 // Inline update failed.
                 // Put the retains back in the side table.
-                ClearExclusive(&isa.bits);
+                ClearExclusive(&isa().bits);
                 sidetable_addExtraRC_nolock(borrow.borrowed);
-                oldisa = LoadExclusive(&isa.bits);
+                oldisa = LoadExclusive(&isa().bits);
                 goto retry;
             }
 
@@ -890,14 +888,14 @@ deallocate:
     // Really deallocate.
 
     ASSERT(newisa.isDeallocating());
-    ASSERT(isa.isDeallocating());
+    ASSERT(isa().isDeallocating());
 
     if (slowpath(sideTableLocked)) sidetable_unlock();
 
     __c11_atomic_thread_fence(__ATOMIC_ACQUIRE);
 
     if (performDealloc) {
-        ((void(*)(objc_object *, SEL))objc_msgSend)(this, @selector(dealloc));
+        this->performDealloc();
     }
     return true;
 }
@@ -921,8 +919,25 @@ inline id
 objc_object::rootAutorelease()
 {
     if (isTaggedPointer()) return (id)this;
-    if (prepareOptimizedReturn(ReturnAtPlus1)) return (id)this;
+    bool nonpointerIsa = false;
+#if ISA_HAS_INLINE_RC
+    nonpointerIsa = isa().nonpointer;
 
+    // When we can cheaply determine if the object is deallocating, avoid
+    // putting it in the pool. Refcounting doesn't work on a deallocating object
+    // so it's pointless to put it in the pool, and potentially dangerous.
+    if (nonpointerIsa && isa().isDeallocating()) return (id)this;
+#endif
+
+    // If the class has custom dealloc initiation, we also want to avoid putting
+    // deallocating instances in the pool even if it's expensive to check. (UIView
+    // and UIViewController need this. rdar://97186669)
+    if (!nonpointerIsa && ISA()->hasCustomDeallocInitiation() && rootIsDeallocating())
+        return (id)this;
+
+    if (prepareOptimizedReturn((id)this, true, ReturnAtPlus1)) return (id)this;
+    if (slowpath(isClass())) return (id)this;
+    
     return rootAutorelease2();
 }
 
@@ -933,7 +948,7 @@ objc_object::rootRetainCount()
     if (isTaggedPointer()) return (uintptr_t)this;
 
     sidetable_lock();
-    isa_t bits = __c11_atomic_load((_Atomic uintptr_t *)&isa.bits, __ATOMIC_RELAXED);
+    isa_t bits = __c11_atomic_load((_Atomic uintptr_t *)&isa().bits, __ATOMIC_RELAXED);
     if (bits.nonpointer) {
         uintptr_t rc = bits.extra_rc;
         if (bits.has_sidetable_rc) {
@@ -974,7 +989,7 @@ inline Class
 objc_object::ISA(bool authenticated __unused)
 {
     ASSERT(!isTaggedPointer()); 
-    return isa.getClass(/*authenticated*/false);
+    return isa().getClass(/*authenticated*/false);
 }
 
 inline Class
@@ -994,7 +1009,7 @@ inline void
 objc_object::initIsa(Class cls)
 {
     ASSERT(!isTaggedPointer()); 
-    isa.setClass(cls, this);
+    isa().setClass(cls, this);
 }
 
 
@@ -1038,7 +1053,7 @@ objc_object::changeIsa(Class cls)
 
     isa_t newisa, oldisa;
     newisa.setClass(cls, this);
-    oldisa.bits = __c11_atomic_exchange((_Atomic uintptr_t *)&isa.bits, newisa.bits, __ATOMIC_RELAXED);
+    oldisa.bits = __c11_atomic_exchange((_Atomic uintptr_t *)&isa().bits, newisa.bits, __ATOMIC_RELAXED);
 
     Class oldcls = oldisa.getDecodedClass(/*authenticated*/false);
     if (oldcls  &&  oldcls->instancesHaveAssociatedObjects()) {
@@ -1082,10 +1097,21 @@ objc_object::setWeaklyReferenced_nolock()
 
 
 inline bool
+objc_object::isUniquelyReferenced()
+{
+    ASSERT(!isTaggedPointer());
+    if (fastpath(!ISA()->hasCustomRR())) {
+        return rootRetainCount() == 1;
+    }
+    return ((NSUInteger(*)(objc_object *, SEL))objc_msgSend)(this, @selector(retainCount)) == 1;
+}
+
+
+inline bool
 objc_object::hasCxxDtor()
 {
     ASSERT(!isTaggedPointer());
-    return isa.getClass(/*authenticated*/false)->hasCxxDtor();
+    return isa().getClass(/*authenticated*/false)->hasCxxDtor();
 }
 
 
@@ -1188,7 +1214,14 @@ inline id
 objc_object::rootAutorelease()
 {
     if (isTaggedPointer()) return (id)this;
-    if (prepareOptimizedReturn(ReturnAtPlus1)) return (id)this;
+
+    // If the class has custom dealloc initiation, we also want to avoid putting
+    // deallocating instances in the pool even if it's expensive to check. (UIView
+    // and UIViewController need this. rdar://97186669)
+    if (ISA()->hasCustomDeallocInitiation() && rootIsDeallocating())
+        return (id)this;
+
+    if (prepareOptimizedReturn((id)this, true, ReturnAtPlus1)) return (id)this;
 
     return rootAutorelease2();
 }
@@ -1387,35 +1420,189 @@ callerAcceptsOptimizedReturn(const void *ra)
 // unknown architecture
 # endif
 
+struct ReturnAutoreleaseInfo {
+    constexpr static int objectShift = 2;
+#if __LP64__
+    constexpr static int objectBits = 64 - objectShift;
+#else
+    constexpr static int objectBits = 32 - objectShift;
+#endif
+    union {
+        struct {
+            uintptr_t returnDisposition: 1;
+            uintptr_t cameFromRootAutorelease: 1;
+            uintptr_t returnedObject: objectBits;
+        };
+        uintptr_t firstWord;
+    };
 
-static ALWAYS_INLINE ReturnDisposition 
-getReturnDisposition()
+    const void *returnAddress;
+
+    ReturnAutoreleaseInfo() :
+    returnDisposition(0), cameFromRootAutorelease(0),
+    returnedObject(0), returnAddress(nullptr) {}
+
+    ReturnAutoreleaseInfo(id obj, bool cameFromRootAutorelease, ReturnDisposition disposition, const void *returnAddress) :
+    returnDisposition(disposition), cameFromRootAutorelease(cameFromRootAutorelease),
+    returnedObject((uintptr_t)obj >> objectShift), returnAddress(returnAddress) {
+        ASSERT(!_objc_isTaggedPointerOrNil(obj));
+        ASSERT(getReturnedObject() == obj);
+    }
+
+    // Indicates that autorelease elision is temporarily disabled.
+    static ReturnAutoreleaseInfo blockedInfo() {
+        ReturnAutoreleaseInfo info;
+        info.firstWord = ~(uintptr_t)0;
+        return info;
+    }
+
+#if !HAS_RETURNADDR_AUTORELEASE_ELISION
+    ReturnAutoreleaseInfo(ReturnDisposition disposition)
+    : returnDisposition(disposition), returnAddress(nullptr) {}
+#endif
+
+    id getReturnedObject() const {
+        return (id)(returnedObject << objectShift);
+    }
+
+    ReturnDisposition getReturnDisposition() const {
+        return ReturnDisposition(returnDisposition);
+    }
+
+    const void *getReturnAddress() const {
+        return returnAddress;
+    }
+
+    bool isEmpty() const {
+        return isBlocked() || (returnedObject == 0 && returnAddress == nullptr);
+    }
+
+    bool isBlocked() const {
+        return firstWord == ~(uintptr_t)0;
+    }
+
+    struct TlsDealloc {
+        void operator()(uintptr_t firstWord);
+    };
+
+    // The actual TLS storage
+    static tls_direct(uintptr_t, tls_key::return_autorelease_object, TlsDealloc) tlsFirstWord;
+    static tls_direct(const void *, tls_key::return_autorelease_address) tlsReturnAddress;
+};
+
+static ALWAYS_INLINE ReturnAutoreleaseInfo
+getReturnAutoreleaseInfo()
 {
-    return (ReturnDisposition)(uintptr_t)tls_get_direct(RETURN_DISPOSITION_KEY);
+    ReturnAutoreleaseInfo info;
+    info.firstWord = ReturnAutoreleaseInfo::tlsFirstWord;
+    info.returnAddress = ReturnAutoreleaseInfo::tlsReturnAddress;
+    return info;
 }
 
 
 static ALWAYS_INLINE void 
-setReturnDisposition(ReturnDisposition disposition)
+setReturnAutoreleaseInfo(ReturnAutoreleaseInfo info)
 {
-    tls_set_direct(RETURN_DISPOSITION_KEY, (void*)(uintptr_t)disposition);
+    ReturnAutoreleaseInfo::tlsFirstWord = info.firstWord;
+    ReturnAutoreleaseInfo::tlsReturnAddress = info.returnAddress;
 }
 
+// If there's an object in the return autorelease TLS, move it into the current
+// autorelease pool.
+void moveTLSAutoreleaseToPool(ReturnAutoreleaseInfo info);
+
+// Get the return address in the client code. In release builds, this just uses
+// __builtin_return_address(0). In debug builds, it will dig a few levels down
+// looking for an address outside libobjc, to see through non-inlined non-tail
+// calls. This is ugly and slow but debug builds are slow anyway, and this
+// keeps autorelease elision consistent between the two.
+static ALWAYS_INLINE void *
+clientReturnAddress(void) {
+#if DEBUG
+    const struct mach_header *libobjcHeader = dyld_image_header_containing_address((void *)objc_retain);
+
+    // Ignore warnings about non-zero arguments to __builtin_return_address. We
+    // will only use it on libobjc frames, which should be safe, and we only do
+    // this in debug builds anyway.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wframe-address"
+    void *prev = nullptr;
+#define FRAME(n) do { \
+    void *candidate = __builtin_return_address(n); \
+    if (!candidate) return prev; \
+    if (dyld_image_header_containing_address(candidate) != libobjcHeader) \
+        return candidate; \
+    prev = candidate; \
+} while(0)
+    // Six levels deep is enough to see through all the intervening stack frames
+    // we currently have.
+    FRAME(0);
+    FRAME(1);
+    FRAME(2);
+    FRAME(3);
+    FRAME(4);
+    FRAME(5);
+#undef FRAME
+    // We didn't find anything outside of libobjc, return the last thing we
+    // checked so we at least have something.
+    return prev;
+#pragma clang diagnostic pop
+#else
+    return __builtin_return_address(0);
+#endif
+}
 
 // Try to prepare for optimized return with the given disposition (+0 or +1).
 // Returns true if the optimized path is successful.
 // Otherwise the return value must be retained and/or autoreleased as usual.
 static ALWAYS_INLINE bool 
-prepareOptimizedReturn(ReturnDisposition disposition)
+prepareOptimizedReturn(id obj, bool cameFromRootAutorelease, ReturnDisposition disposition)
 {
-    ASSERT(getReturnDisposition() == ReturnAtPlus0);
+#if HAS_RETURNADDR_AUTORELEASE_ELISION
+    ReturnAutoreleaseInfo info = getReturnAutoreleaseInfo();
 
-    if (callerAcceptsOptimizedReturn(__builtin_return_address(0))) {
-        if (disposition) setReturnDisposition(disposition);
+    // If we're blocking elision, return right away.
+    if (info.isBlocked())
+        return false;
+
+    // Move a leftover TLS entry, if any, to the actual autorelease pool.
+    moveTLSAutoreleaseToPool(info);
+
+    if (_objc_isTaggedPointerOrNil(obj)) {
+        setReturnAutoreleaseInfo({});
+        return true;
+    }
+
+    // If the object's class isn't initialized, make that happen now.
+    // Initializing later can cause +initialize to run in unexpected lock
+    // contexts. rdar://88956559
+    if (slowpath(!obj->ISA()->isInitialized())) {
+        class_initialize(obj->ISA(true /*authenticated*/), obj);
+    }
+
+    // If the object has custom RR overrides and this is an explicit return
+    // optimization call, then check the caller's code, since we want to send a
+    // real autorelease message if the caller isn't going to claim. If the
+    // caller claims without a NOP then we'll still optimize the return in the
+    // autorelease call.
+    if (!cameFromRootAutorelease && obj->ISA()->hasCustomRR())
+        if (!callerAcceptsOptimizedReturn(clientReturnAddress()))
+            return false;
+
+
+    setReturnAutoreleaseInfo({obj, cameFromRootAutorelease, disposition, clientReturnAddress()});
+    return true;
+#else
+    ASSERT(getReturnAutoreleaseInfo().getReturnDisposition() == ReturnAtPlus0);
+
+    if (callerAcceptsOptimizedReturn(clientReturnAddress())) {
+        if (disposition)
+            setReturnAutoreleaseInfo({disposition});
         return true;
     }
 
     return false;
+#endif
 }
 
 
@@ -1423,11 +1610,50 @@ prepareOptimizedReturn(ReturnDisposition disposition)
 // Returns the disposition of the returned object (+0 or +1).
 // An un-optimized return is +0.
 static ALWAYS_INLINE ReturnDisposition 
-acceptOptimizedReturn()
+acceptOptimizedReturn(bool expectsNOP)
 {
-    ReturnDisposition disposition = getReturnDisposition();
-    setReturnDisposition(ReturnAtPlus0);  // reset to the unoptimized state
-    return disposition;
+#if HAS_RETURNADDR_AUTORELEASE_ELISION
+#   if __arm64__
+    // Expected deltas are 1 instruction with no NOP, 2 instructions with a NOP.
+    const uintptr_t expectedDeltaWithNOP = 8;
+    const uintptr_t expectedDeltaNoNOP = 4;
+#   else
+#       error Unsupported architecture for return-address autorelease elision.
+#   endif
+    ReturnAutoreleaseInfo info = getReturnAutoreleaseInfo();
+    if (info.isEmpty())
+        return ReturnAtPlus0;
+
+    setReturnAutoreleaseInfo({});  // reset to the unoptimized state
+
+    uintptr_t previousReturnAddress = (uintptr_t)info.getReturnAddress();
+    uintptr_t currentReturnAddress = (uintptr_t)clientReturnAddress();
+
+    uintptr_t delta = currentReturnAddress - previousReturnAddress;
+
+    uintptr_t expectedDelta = expectsNOP ? expectedDeltaWithNOP : expectedDeltaNoNOP;
+
+    if (delta == expectedDelta)
+        return info.getReturnDisposition();
+
+    // If the delta is wrong, we may be in a situation like call, nop, add, claim.
+    // Check the caller's code for the NOP as a fallback.
+    if (expectsNOP) {
+        if (callerAcceptsOptimizedReturn(info.getReturnAddress()))
+            return info.getReturnDisposition();
+    }
+
+    // Handoff failed. If we're at +1, we need to move the value out of TLS and
+    // into the main pool.
+    if (info.getReturnDisposition() == ReturnAtPlus1)
+        moveTLSAutoreleaseToPool(info);
+
+    return ReturnAtPlus0;
+#else
+    ReturnAutoreleaseInfo info = getReturnAutoreleaseInfo();
+    setReturnAutoreleaseInfo({});
+    return info.getReturnDisposition();
+#endif
 }
 
 
@@ -1437,14 +1663,14 @@ acceptOptimizedReturn()
 
 
 static ALWAYS_INLINE bool
-prepareOptimizedReturn(ReturnDisposition disposition __unused)
+prepareOptimizedReturn(id obj __unused, bool cameFromRootAutorelease __unused, ReturnDisposition disposition __unused)
 {
     return false;
 }
 
 
 static ALWAYS_INLINE ReturnDisposition 
-acceptOptimizedReturn()
+acceptOptimizedReturn(bool expectsNOP __unused)
 {
     return ReturnAtPlus0;
 }

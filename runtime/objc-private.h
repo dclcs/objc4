@@ -112,7 +112,10 @@ public:
 
 struct objc_object {
 private:
-    isa_t isa;
+    char isa_storage[sizeof(isa_t)];
+
+    isa_t &isa() { return *reinterpret_cast<isa_t *>(isa_storage); }
+    const isa_t &isa() const { return *reinterpret_cast<const isa_t *>(isa_storage); }
 
 public:
 
@@ -144,7 +147,6 @@ public:
 
     bool hasNonpointerIsa();
     bool isTaggedPointer();
-    bool isTaggedPointerOrNil();
     bool isBasicTaggedPointer();
     bool isExtTaggedPointer();
     bool isClass();
@@ -156,6 +158,9 @@ public:
     // object may be weakly referenced?
     bool isWeaklyReferenced();
     void setWeaklyReferenced_nolock();
+
+    // object may be uniquely referenced?
+    bool isUniquelyReferenced();
 
     // object may have -.cxx_destruct implementation?
     bool hasCxxDtor();
@@ -183,7 +188,6 @@ private:
 
     // Slow paths for inline control
     id rootAutorelease2();
-    uintptr_t overrelease_error();
 
 #if SUPPORT_NONPOINTER_ISA
     // Controls what parts of root{Retain,Release} to emit/inline
@@ -237,20 +241,19 @@ private:
 #if DEBUG
     bool sidetable_present();
 #endif
+
+    void performDealloc();
 };
 
 
-#if __OBJC2__
-typedef struct method_t *Method;
+// signed_method_t is a dummy type that exists to distinguish between
+// externally-visible Method values and internal method_t* values.
+// Externally-visible Method values are signed on ptrauth archs.
+// Use _method_auth and _method_sign to convert between them.
+typedef struct signed_method_t *Method;
 typedef struct ivar_t *Ivar;
 typedef struct category_t *Category;
 typedef struct property_t *objc_property_t;
-#else
-typedef struct old_method *Method;
-typedef struct old_ivar *Ivar;
-typedef struct old_category *Category;
-typedef struct old_property *objc_property_t;
-#endif
 
 // Public headers
 
@@ -276,11 +279,7 @@ typedef struct old_property *objc_property_t;
 
 #include "objc-ptrauth.h"
 
-#if __OBJC2__
 #include "objc-runtime-new.h"
-#else
-#include "objc-runtime-old.h"
-#endif
 
 #include "objc-references.h"
 #include "objc-initialize.h"
@@ -516,25 +515,6 @@ public:
 
     bool hasPreoptimizedSectionLookups() const;
 
-#if !__OBJC2__
-    struct old_protocol **proto_refs;
-    struct objc_module *mod_ptr;
-    size_t              mod_count;
-# if TARGET_OS_WIN32
-    struct objc_module **modules;
-    size_t moduleCount;
-    struct old_protocol **protocols;
-    size_t protocolCount;
-    void *imageinfo;
-    size_t imageinfoBytes;
-    SEL *selrefs;
-    size_t selrefCount;
-    struct objc_class **clsrefs;
-    size_t clsrefCount;    
-    TCHAR *moduleName;
-# endif
-#endif
-
 private:
     // Images in the shared cache will have an empty array here while those
     // allocated at run time will allocate a single entry.
@@ -569,11 +549,7 @@ static inline bool sectnameStartsWith(const char *sectname, const char *prefix){
     return segnameStartsWith(sectname, prefix);
 }
 
-
-#if __OBJC2__
 extern bool didCallDyldNotifyRegister;
-#endif
-
 
 /* selectors */
 extern void sel_init(size_t selrefCount);
@@ -594,7 +570,7 @@ extern Protocol *getSharedCachePreoptimizedProtocol(const char *name);
 
 extern unsigned getPreoptimizedClassUnreasonableCount();
 extern Class getPreoptimizedClass(const char *name);
-extern Class* copyPreoptimizedClasses(const char *name, int *outCount);
+extern Class getPreoptimizedClassesWithMetaClass(Class metacls);
 
 extern Class _calloc_class(size_t size);
 
@@ -695,17 +671,19 @@ extern void gdb_objc_class_changed(Class cls, unsigned long changes, const char 
 
 // Settings from environment variables
 #define OPTION(var, env, help) extern bool var;
+#define INTERNAL_OPTION(var, env, help) extern bool var;
 #include "objc-env.h"
 #undef OPTION
+#undef INTERNAL_OPTION
 
 extern void environ_init(void);
 extern void runtime_init(void);
 
-extern void logReplacedMethod(const char *className, SEL s, bool isMeta, const char *catName, IMP oldImp, IMP newImp);
+extern void logReplacedMethod(const char *className, SEL s, bool isMeta, const char *catName, void *oldImp, void *newImp);
 
 
 // objc per-thread storage
-typedef struct {
+struct _objc_pthread_data {
     struct _objc_initializing_classes *initializingClasses; // for +initialize
     struct SyncCache *syncCache;  // for @synchronize
     struct alt_handler_list *handlerList;  // for exception alt handlers
@@ -714,13 +692,11 @@ typedef struct {
     unsigned classNameLookupsAllocated;
     unsigned classNameLookupsUsed;
 
-    // If you add new fields here, don't forget to update 
-    // _objc_pthread_destroyspecific()
-
-} _objc_pthread_data;
+    // If you add new fields here, don't forget to update the destructor
+    ~_objc_pthread_data();
+};
 
 extern _objc_pthread_data *_objc_fetch_pthread_data(bool create);
-extern void tls_init(void);
 
 // encoding.h
 extern unsigned int encoding_getNumberOfArguments(const char *typedesc);
@@ -771,7 +747,8 @@ extern Class look_up_class(const char *aClassName, bool includeUnconnected, bool
 extern "C" void map_images(unsigned count, const char * const paths[],
                            const struct mach_header * const mhdrs[]);
 extern void map_images_nolock(unsigned count, const char * const paths[],
-                              const struct mach_header * const mhdrs[]);
+                              const struct mach_header * const mhdrs[],
+                              bool *disabledClassROEnforcement);
 extern void load_images(const char *path, const struct mach_header *mh);
 extern void unmap_image(const char *path, const struct mach_header *mh);
 extern void unmap_image_nolock(const struct mach_header *mh);
@@ -883,6 +860,13 @@ inline void operator delete[](void* p, const std::nothrow_t&) noexcept(true) { f
 #pragma clang diagnostic pop
 #endif
 
+// Overflow-detecting wrapper around malloc(n * m)
+static inline void *alloc_overflow(size_t n, size_t m) {
+    size_t total;
+    if (__builtin_mul_overflow(n, m, &total))
+        _objc_fatal("attempt to allocate %zu * %zu bytes would overflow", n, m);
+    return malloc(total);
+}
 
 class TimeLogger {
     uint64_t mStart;
@@ -950,29 +934,36 @@ class StripedMap {
 
     void forceResetAll() {
         for (unsigned int i = 0; i < StripeCount; i++) {
-            array[i].value.forceReset();
+            array[i].value.reset();
         }
     }
 
     void defineLockOrder() {
         for (unsigned int i = 1; i < StripeCount; i++) {
-            lockdebug_lock_precedes_lock(&array[i-1].value, &array[i].value);
+            lockdebug::lock_precedes_lock(&array[i-1].value, &array[i].value);
         }
     }
 
     void precedeLock(const void *newlock) {
         // assumes defineLockOrder is also called
-        lockdebug_lock_precedes_lock(&array[StripeCount-1].value, newlock);
+        lockdebug::lock_precedes_lock(&array[StripeCount-1].value, newlock);
     }
 
     void succeedLock(const void *oldlock) {
         // assumes defineLockOrder is also called
-        lockdebug_lock_precedes_lock(oldlock, &array[0].value);
+        lockdebug::lock_precedes_lock(oldlock, &array[0].value);
     }
 
     const void *getLock(int i) {
         if (i < StripeCount) return &array[i].value;
         else return nil;
+    }
+
+    template<typename F>
+    void forEach(F f) {
+        for (int i = 0; i < StripeCount; i++) {
+            f(array[i].value);
+        }
     }
     
 #if DEBUG

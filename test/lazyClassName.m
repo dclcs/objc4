@@ -20,7 +20,7 @@ struct ObjCClass {
     struct ObjCClass * __ptrauth_objc_super_pointer superclass;
     void *cachePtr;
     uintptr_t zero;
-    uintptr_t data;
+    void *__ptrauth_objc_class_ro data;
 };
 
 struct ObjCClass_ro {
@@ -35,7 +35,7 @@ struct ObjCClass_ro {
         const uint8_t * ivarLayout;
         struct ObjCClass * nonMetaClass;
     };
-    
+
     const char * name;
     struct ObjCMethodList * __ptrauth_objc_method_list_pointer baseMethodList;
     struct protocol_list_t * baseProtocols;
@@ -62,7 +62,7 @@ struct ObjCClass LazyClassNameMetaclass = {
     .isa = &OBJC_METACLASS_$_NSObject,
     .superclass = &OBJC_METACLASS_$_NSObject,
     .cachePtr = &_objc_empty_cache,
-    .data = (uintptr_t)&LazyClassNameMetaclass_ro,
+    .data = &LazyClassNameMetaclass_ro,
 };
 
 struct ObjCClass_ro LazyClassName_ro = {
@@ -74,7 +74,7 @@ struct ObjCClass LazyClassName = {
     .isa = &LazyClassNameMetaclass,
     .superclass = &OBJC_CLASS_$_NSObject,
     .cachePtr = &_objc_empty_cache,
-    .data = (uintptr_t)&LazyClassName_ro + 2,
+    .data = (void *)((uintptr_t)&LazyClassName_ro + 2),
 };
 
 struct ObjCClass_ro LazyClassName2Metaclass_ro = {
@@ -88,7 +88,7 @@ struct ObjCClass LazyClassName2Metaclass = {
     .isa = &OBJC_METACLASS_$_NSObject,
     .superclass = &OBJC_METACLASS_$_NSObject,
     .cachePtr = &_objc_empty_cache,
-    .data = (uintptr_t)&LazyClassName2Metaclass_ro,
+    .data = &LazyClassName2Metaclass_ro,
 };
 
 struct ObjCClass_ro LazyClassName2_ro = {
@@ -100,7 +100,7 @@ struct ObjCClass LazyClassName2 = {
     .isa = &LazyClassName2Metaclass,
     .superclass = &OBJC_CLASS_$_NSObject,
     .cachePtr = &_objc_empty_cache,
-    .data = (uintptr_t)&LazyClassName2_ro + 2,
+    .data = (void *)((uintptr_t)&LazyClassName2_ro + 2),
 };
 
 static objc_hook_lazyClassNamer OrigNamer;
@@ -130,7 +130,11 @@ int main() {
     objc_setHook_lazyClassNamer(ClassNamer, &OrigNamer);
     objc_setHook_lazyClassNamer(ClassNamer2, &OrigNamer2);
 #pragma clang diagnostic pop
-  
+
     printf("%s\n", class_getName([(__bridge id)&LazyClassName class]));
     printf("%s\n", class_getName([(__bridge id)&LazyClassName2 class]));
+    testassertequal((__bridge void *)[(__bridge id)&LazyClassName class],
+                    (__bridge void *)objc_getClass(class_getName([(__bridge id)&LazyClassName class])));
+    testassertequal((__bridge void *)[(__bridge id)&LazyClassName2 class],
+                    (__bridge void *)objc_getClass(class_getName([(__bridge id)&LazyClassName2 class])));
 }

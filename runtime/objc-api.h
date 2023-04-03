@@ -28,6 +28,7 @@
 #include <Availability.h>
 #include <AvailabilityMacros.h>
 #include <TargetConditionals.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 #ifndef __has_feature
@@ -54,7 +55,6 @@
 #   endif
 #endif
 
-#ifndef __APPLE_BLEACH_SDK__
 # if __has_feature(attribute_availability_bridgeos)
 #   ifndef __BRIDGEOS_AVAILABLE
 #       define __BRIDGEOS_AVAILABLE(_vers) __OS_AVAILABILITY(bridgeos,introduced=_vers)
@@ -76,7 +76,6 @@
 #       define __BRIDGEOS_UNAVAILABLE
 #   endif
 # endif
-#endif
 
 /*
  * OBJC_API_VERSION 0 or undef: Tiger and earlier API only
@@ -139,81 +138,37 @@
 
 
 /* OBJC_AVAILABLE: shorthand for all-OS availability */
-#ifndef __APPLE_BLEACH_SDK__
 #   if !defined(OBJC_AVAILABLE)
 #       define OBJC_AVAILABLE(x, i, t, w, b)                            \
             __OSX_AVAILABLE(x)  __IOS_AVAILABLE(i)  __TVOS_AVAILABLE(t) \
             __WATCHOS_AVAILABLE(w)  __BRIDGEOS_AVAILABLE(b)
 #   endif
-#else
-#   if !defined(OBJC_AVAILABLE)
-#       define OBJC_AVAILABLE(x, i, t, w, b)                            \
-            __OSX_AVAILABLE(x)  __IOS_AVAILABLE(i)  __TVOS_AVAILABLE(t) \
-            __WATCHOS_AVAILABLE(w)
-#   endif
-#endif
 
 
 /* OBJC_OSX_DEPRECATED_OTHERS_UNAVAILABLE: Deprecated on OS X,
  * unavailable everywhere else. */
-#ifndef __APPLE_BLEACH_SDK__
 #   if !defined(OBJC_OSX_DEPRECATED_OTHERS_UNAVAILABLE)
 #       define OBJC_OSX_DEPRECATED_OTHERS_UNAVAILABLE(_start, _dep, _msg) \
             __OSX_DEPRECATED(_start, _dep, _msg)                          \
             __IOS_UNAVAILABLE __TVOS_UNAVAILABLE                          \
             __WATCHOS_UNAVAILABLE __BRIDGEOS_UNAVAILABLE
 #   endif
-#else
-#   if !defined(OBJC_OSX_DEPRECATED_OTHERS_UNAVAILABLE)
-#       define OBJC_OSX_DEPRECATED_OTHERS_UNAVAILABLE(_start, _dep, _msg) \
-            __OSX_DEPRECATED(_start, _dep, _msg)                          \
-            __IOS_UNAVAILABLE __TVOS_UNAVAILABLE                          \
-            __WATCHOS_UNAVAILABLE
-#   endif
-#endif
 
 
 /* OBJC_OSX_AVAILABLE_OTHERS_UNAVAILABLE: Available on OS X,
  * unavailable everywhere else. */
-#ifndef __APPLE_BLEACH_SDK__
 #   if !defined(OBJC_OSX_AVAILABLE_OTHERS_UNAVAILABLE)
 #       define OBJC_OSX_AVAILABLE_OTHERS_UNAVAILABLE(vers) \
             __OSX_AVAILABLE(vers)                          \
             __IOS_UNAVAILABLE __TVOS_UNAVAILABLE           \
             __WATCHOS_UNAVAILABLE __BRIDGEOS_UNAVAILABLE
 #    endif
-#else
-#   if !defined(OBJC_OSX_AVAILABLE_OTHERS_UNAVAILABLE)
-#       define OBJC_OSX_AVAILABLE_OTHERS_UNAVAILABLE(vers) \
-            __OSX_AVAILABLE(vers)                          \
-            __IOS_UNAVAILABLE __TVOS_UNAVAILABLE           \
-            __WATCHOS_UNAVAILABLE
-#    endif
-#endif
 
 
 /* OBJC_ISA_AVAILABILITY: `isa` will be deprecated or unavailable 
  * in the future */
 #if !defined(OBJC_ISA_AVAILABILITY)
-#   if __OBJC2__
-#       define OBJC_ISA_AVAILABILITY  __attribute__((deprecated))
-#   else
-#       define OBJC_ISA_AVAILABILITY  /* still available */
-#   endif
-#endif
-
-
-/* OBJC2_UNAVAILABLE: unavailable in objc 2.0, deprecated in Leopard */
-#if !defined(OBJC2_UNAVAILABLE)
-#   if __OBJC2__
-#       define OBJC2_UNAVAILABLE UNAVAILABLE_ATTRIBUTE
-#   else
-        /* plain C code also falls here, but this is close enough */
-#       define OBJC2_UNAVAILABLE                                       \
-            __OSX_DEPRECATED(10.5, 10.5, "not available in __OBJC2__") \
-            __IOS_DEPRECATED(2.0, 2.0, "not available in __OBJC2__")   \
-            __TVOS_UNAVAILABLE __WATCHOS_UNAVAILABLE __BRIDGEOS_UNAVAILABLE
-#   endif
+#   define OBJC_ISA_AVAILABILITY  __attribute__((deprecated))
 #endif
 
 /* OBJC_UNAVAILABLE: unavailable, with a message where supported */
@@ -275,15 +230,7 @@
 #endif
 
 #if !defined(OBJC_VISIBLE)
-#   if TARGET_OS_WIN32
-#       if defined(BUILDING_OBJC)
-#           define OBJC_VISIBLE __declspec(dllexport)
-#       else
-#           define OBJC_VISIBLE __declspec(dllimport)
-#       endif
-#   else
 #       define OBJC_VISIBLE  __attribute__((visibility("default")))
-#   endif
 #endif
 
 #if !defined(OBJC_EXPORT)
@@ -328,6 +275,43 @@
 #       define OBJC_RETURNS_RETAINED __attribute__((ns_returns_retained))
 #   else
 #       define OBJC_RETURNS_RETAINED
+#   endif
+#endif
+
+/* OBJC_COLD: very rarely called, e.g. on error path */
+#if !defined(OBJC_COLD)
+#   if __OBJC__ && __has_attribute(cold)
+#       define OBJC_COLD __attribute__((cold))
+#   else
+#       define OBJC_COLD
+#   endif
+#endif
+
+/* OBJC_NORETURN: does not return normally, but may throw */
+#if !defined(OBJC_NORETURN)
+#   if __OBJC__ && __has_attribute(noreturn)
+#       define OBJC_NORETURN __attribute__((noreturn))
+#   else
+#       define OBJC_NORETURN
+#   endif
+#endif
+
+/* OBJC_NOESCAPE: marks a block as nonescaping */
+#if !defined(OBJC_NOESCAPE)
+#   if __has_attribute(noescape)
+#       define OBJC_NOESCAPE __attribute__((noescape))
+#   else
+#       define OBJC_NOESCAPE
+#   endif
+#endif
+
+/* OBJC_REFINED_FOR_SWIFT: hide the definition from Swift as we have a
+   better one in the overlay */
+#if !defined(OBJC_REFINED_FOR_SWIFT)
+#   if __has_attribute(swift_private)
+#       define OBJC_REFINED_FOR_SWIFT __attribute__((swift_private))
+#   else
+#       define OBJC_REFINED_FOR_SWIFT
 #   endif
 #endif
 

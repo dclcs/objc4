@@ -487,8 +487,9 @@ ustrdupMaybeNil(const uint8_t *str)
     (dyld_program_sdk_at_least(dyld_platform_version_macOS_ ## x)   || \
      dyld_program_sdk_at_least(dyld_platform_version_iOS_ ## i)     || \
      dyld_program_sdk_at_least(dyld_platform_version_tvOS_ ## t)    || \
-     dyld_program_sdk_at_least(dyld_platform_version_watchOS_ ## w) || \
-     dyld_program_sdk_at_least(dyld_platform_version_bridgeOS_ ## b))
+     dyld_program_sdk_at_least(dyld_platform_version_watchOS_ ## w))
+//|| \
+//     dyld_program_sdk_at_least(dyld_platform_version_bridgeOS_ ## b))
 
 
 // If we don't have asprintf(), use our own implementation instead

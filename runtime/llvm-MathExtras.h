@@ -17,7 +17,7 @@
 #define LLVM_SUPPORT_MATHEXTRAS_H
 
 #include <stdint.h>
-#include <cstdint>
+
 namespace objc {
 
 // NOTE: The following support functions use the _32/_64 extensions instead of

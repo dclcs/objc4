@@ -1083,9 +1083,9 @@ void cache_t::init()
 
     kr = task_restartable_ranges_register(mach_task_self(),
                                           objc_restartableRanges, count);
-    if (kr == KERN_SUCCESS) return;
-    _objc_fatal("task_restartable_ranges_register failed (result 0x%x: %s)",
-                kr, mach_error_string(kr));
+//    if (kr == KERN_SUCCESS) return;
+//    _objc_fatal("task_restartable_ranges_register failed (result 0x%x: %s)",
+//                kr, mach_error_string(kr));
 #endif // HAVE_TASK_RESTARTABLE_RANGES
 }
 
@@ -1136,18 +1136,18 @@ static int _collecting_in_critical(void)
             continue;
 
         // Find out where thread is executing
-#if TARGET_OS_OSX
+//#if TARGET_OS_OSX
 //        if (oah_is_current_process_translated()) {
 //            kern_return_t ret = objc_thread_get_rip(threads[count], (uint64_t*)&pc);
 //            if (ret != KERN_SUCCESS) {
 //                pc = PC_SENTINEL;
 //            }
 //        } else {
-            pc = _get_pc_for_thread (threads[count]);
+//            pc = _get_pc_for_thread (threads[count]);
 //        }
-#else
+//#else
         pc = _get_pc_for_thread (threads[count]);
-#endif
+//#endif
 
         // Check for bad status, and if so, assume the worse (can't collect)
         if (pc == PC_SENTINEL)

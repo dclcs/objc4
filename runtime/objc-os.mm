@@ -422,13 +422,13 @@ map_images_nolock(unsigned mhCount, const char * const mhPaths[],
         // check the headers we get passed in for an MH_EXECUTABLE,
         // because dyld helpfully omits images that contain no ObjC,
         // and the main executable might not contain ObjC.
-        const headerType *mainExecutableHeader = (headerType *)_dyld_get_prog_image_header();
-        if (mainExecutableHeader
-            && mainExecutableHeader->cputype == CPU_TYPE_ARM64
-            && ((mainExecutableHeader->cpusubtype & ~CPU_SUBTYPE_MASK)
-                == CPU_SUBTYPE_ARM64E)) {
-            executableIsARM64e = true;
-        }
+//        const headerType *mainExecutableHeader = (headerType *)_dyld_get_prog_image_header();
+//        if (mainExecutableHeader
+//            && mainExecutableHeader->cputype == CPU_TYPE_ARM64
+//            && ((mainExecutableHeader->cpusubtype & ~CPU_SUBTYPE_MASK)
+//                == CPU_SUBTYPE_ARM64E)) {
+//            executableIsARM64e = true;
+//        }
     }
 
     // If the main executable is ARM64e, make sure every image that is loaded

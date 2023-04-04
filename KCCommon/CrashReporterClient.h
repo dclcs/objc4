@@ -33,12 +33,11 @@
 /* Fake the CrashReporterClient API */
 #define CRGetCrashLogMessage() 0
 #define CRSetCrashLogMessage(x) /* nothing */
-#define LIBC_NO_LIBCRASHREPORTERCLIENT
 
 #else /* !LIBC_NO_LIBCRASHREPORTERCLIENT */
 
 /* Include the real CrashReporterClient.h */
-#include_next <CrashReporterClient.h>
+#include <CrashReporterClient.h>
 
 #endif /* !LIBC_NO_LIBCRASHREPORTERCLIENT */
 

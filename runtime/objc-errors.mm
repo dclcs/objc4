@@ -114,6 +114,7 @@ static void _objc_syslog(const char *message)
 //    }
     _simple_asl_log(ASL_LEVEL_ERR, nil, message);
 
+
     if (do_stderr) {
         write(STDERR_FILENO, message, strlen(message));
     }

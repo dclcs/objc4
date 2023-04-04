@@ -36,7 +36,7 @@
 #include <TargetConditionals.h>
 
 //#include <os/feature_private.h> // os_feature_enabled_simple()
-#include <os/variant_private.h> // os_variant_allows_internal_security_policies()
+//#include <os/variant_private.h> // os_variant_allows_internal_security_policies()
 
 #include "llvm-MathExtras.h"
 #include "objc-private.h"
@@ -122,7 +122,7 @@ id objc_noop_imp(id self, SEL _cmd __unused) {
 * Some test code looks for the presence of this symbol.
 **********************************************************************/
 #if DEBUG != OBJC_IS_DEBUG_BUILD
-//#error mismatch in debug-ness macros
+#error mismatch in debug-ness macros
 // DEBUG is used in our code. OBJC_IS_DEBUG_BUILD is used in the
 // header declaration of _objc_isDebugBuild() because that header
 // is visible to other clients who might have their own DEBUG macro.
@@ -366,15 +366,15 @@ void environ_init(void)
     // rdar://problem/63886091
 //    if (!dyld_program_sdk_at_least(dyld_fall_2020_os_versions))
 //        DisableAutoreleaseCoalescingLRU = true;
-
-    // class_rx_t pointer signing enforcement is *disabled* by default unless
-    // this OS feature is enabled, but it can be explicitly enabled by setting
-    // the environment variable, for testing.
+//
+//    // class_rx_t pointer signing enforcement is *disabled* by default unless
+//    // this OS feature is enabled, but it can be explicitly enabled by setting
+//    // the environment variable, for testing.
 //    if (!os_feature_enabled_simple(objc4, classRxSigning, false))
 //        DisableClassRXSigningEnforcement = true;
-
-    // Faults for class_ro_t pointer signing enforcement are disabled by
-    // default unless this OS feature is enabled.
+//
+//    // Faults for class_ro_t pointer signing enforcement are disabled by
+//    // default unless this OS feature is enabled.
 //    if (!os_feature_enabled_simple(objc4, classRoSigningFaults, false))
 //        DisableClassROFaults = true;
 
@@ -413,9 +413,9 @@ void environ_init(void)
         
         for (size_t i = 0; i < sizeof(Settings)/sizeof(Settings[0]); i++) {
             const option_t *opt = &Settings[i];
-            if (opt->internal
-                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
-                continue;
+//            if (opt->internal
+//                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
+//                continue;
             if ((size_t)(value - *p) == 1+opt->envlen  &&  
                 0 == strncmp(*p, opt->env, opt->envlen))
             {
@@ -463,9 +463,9 @@ void environ_init(void)
 
         for (size_t i = 0; i < sizeof(Settings)/sizeof(Settings[0]); i++) {
             const option_t *opt = &Settings[i];
-            if (opt->internal
-                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
-                continue;
+//            if (opt->internal
+//                && !os_variant_allows_internal_security_policies("com.apple.obj-c"))
+//                continue;
             if (PrintHelp) _objc_inform("%s: %s", opt->env, opt->help);
             if (PrintOptions && *opt->var) _objc_inform("%s is set", opt->env);
         }
